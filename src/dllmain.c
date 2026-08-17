@@ -4,7 +4,8 @@
  *   - CombatManager::ApplyDamage captures attacker/target ownership context.
  *   - One selected damage stream enters the meters: raw OR post-mitigation.
  *   - Four independent meters: player dealt, player incoming, player pets, other.
- *   - Ten 500 ms buckets, 64 damage-type slots, a rolling five-second window.
+ *   - Ten 500 ms buckets, direct/DOT lanes for 64 base damage types, and a
+ *     rolling five-second window.
  *   - DPS divisor is the active event span, clamped to at least one second.
  *   - Running totals and a retained best-average snapshot are kept per meter.
  *
@@ -28,6 +29,7 @@
 #define SYM_GetExperiencePoints "?GetExperiencePoints@Character@GAME@@QEBA?BIXZ"
 #define SYM_ApplyDamageCM       "?ApplyDamage@CombatManager@GAME@@QEAA_NMAEBUPlayStatsDamageType@2@W4CombatAttributeType@2@AEBV?$vector@I@mem@@@Z"
 #define SYM_SubtractLife        "?SubtractLife@Character@GAME@@QEAAXMAEBUPlayStatsDamageType@2@_N_N@Z"
+#define SYM_ExecuteDurationDamage "?ExecuteDamage@DurationDamageManager@GAME@@IEAAMAEAM@Z"
 #define SYM_GetAttackerIdCM     "?GetAttackerId@CombatManager@GAME@@QEBA?BIXZ"
 #define SYM_GetObjectId         "?GetObjectId@Object@GAME@@QEBAIXZ"
 #define SYM_GetMasterAttacker   "?GetMasterAttacker@GameEngine@GAME@@QEBAII@Z"
@@ -40,6 +42,7 @@
 #define SYM_GetExperiencePoints "?GetExperiencePoints@Character@GAME@@QBE?BIXZ"
 #define SYM_ApplyDamageCM       "?ApplyDamage@CombatManager@GAME@@QAE_NMABUPlayStatsDamageType@2@W4CombatAttributeType@2@ABV?$vector@I@mem@@@Z"
 #define SYM_SubtractLife        "?SubtractLife@Character@GAME@@QAEXMABUPlayStatsDamageType@2@_N_N@Z"
+#define SYM_ExecuteDurationDamage "?ExecuteDamage@DurationDamageManager@GAME@@IAEMAAM@Z"
 #define SYM_GetAttackerIdCM     "?GetAttackerId@CombatManager@GAME@@QBE?BIXZ"
 #define SYM_GetObjectId         "?GetObjectId@Object@GAME@@QBEIXZ"
 #define SYM_GetMasterAttacker   "?GetMasterAttacker@GameEngine@GAME@@QBEII@Z"
@@ -102,10 +105,13 @@ typedef unsigned char (GAME_MEMBER_CALL *ApplyDamageCM_t)(void *self, float dama
     const void *dmgType, int attr, const void *vec);
 typedef void (GAME_MEMBER_CALL *SubtractLife_t)(void *self, float damage,
     const void *dmgType, unsigned char a, unsigned char b);
+typedef float (GAME_MEMBER_CALL *ExecuteDurationDamage_t)(void *self,
+    float *accumulated_damage);
 
 static GetMainPlayer_t g_OrigGetMainPlayer;
 static ApplyDamageCM_t g_OrigApplyDamageCM;
 static SubtractLife_t g_OrigSubtractLife;
+static ExecuteDurationDamage_t g_OrigExecuteDurationDamage;
 static GetUInt_t g_fnGetAttackerIdCM;
 static GetUInt_t g_fnGetObjectId;
 static GetMasterAttacker_t g_fnGetMasterAttacker;
@@ -121,6 +127,12 @@ static volatile LONG g_classification_logs;
 static int g_identity_symbols_ready;
 
 /* ---------------- DPYes-style meter state ---------------- */
+typedef enum DamagePhase {
+    DAMAGE_DIRECT = 0,
+    DAMAGE_DOT,
+    DAMAGE_PHASE_COUNT
+} DamagePhase;
+
 typedef enum MeterKind {
     METER_PLAYER_DEALT = 0,
     METER_PLAYER_INCOMING,
@@ -133,26 +145,26 @@ typedef struct DpsBucket {
     DWORD bucket_ms;
     DWORD first_event_ms;
     DWORD last_event_ms;
-    float damage[DPS_TYPE_COUNT];
+    float damage[DAMAGE_PHASE_COUNT][DPS_TYPE_COUNT];
     int valid;
 } DpsBucket;
 
 typedef struct DpsMeter {
     DpsBucket buckets[DPS_BUCKET_COUNT];
     unsigned bucket_index;
-    double type_total[DPS_TYPE_COUNT];
+    double type_total[DAMAGE_PHASE_COUNT][DPS_TYPE_COUNT];
     double total_damage;
     unsigned event_count;
 
-    float best_dps[DPS_TYPE_COUNT];
+    float best_dps[DAMAGE_PHASE_COUNT][DPS_TYPE_COUNT];
     float best_total_dps;
     DWORD best_at_ms;
 } DpsMeter;
 
 typedef struct MeterView {
-    float dps[DPS_TYPE_COUNT];
-    float best_dps[DPS_TYPE_COUNT];
-    double type_total[DPS_TYPE_COUNT];
+    float dps[DAMAGE_PHASE_COUNT][DPS_TYPE_COUNT];
+    float best_dps[DAMAGE_PHASE_COUNT][DPS_TYPE_COUNT];
+    double type_total[DAMAGE_PHASE_COUNT][DPS_TYPE_COUNT];
     float total_dps;
     float best_total_dps;
     double total_damage;
@@ -174,20 +186,20 @@ static const unsigned char g_type_order[DPS_TYPE_COUNT] = {
 static wchar_t g_unknown_type_names[DPS_TYPE_COUNT][16];
 
 static const wchar_t *damage_type_wname(unsigned type) {
-    /* Game.dll's CombatAttributeType values are one-based. Periodic damage
-     * shares its base type with the corresponding direct damage in DPYes:
-     * e.g. Frostburn is accumulated in Cold, and Poison in Acid. */
+    /* Game.dll's CombatAttributeType values are one-based. These are the
+     * direct/base names; duration damage uses the same numeric base type but
+     * is rendered through damage_phase_wname() with its DOT-specific name. */
     switch (type) {
     case 0:  return L"环境";
     case 1:  return L"物理穿刺";
-    case 2:  return L"物理/创伤";
+    case 2:  return L"物理";
     case 3:  return L"穿刺比例";
     case 4:  return L"穿刺";
-    case 5:  return L"冰冷/霜燃";
-    case 6:  return L"火焰/燃烧";
-    case 7:  return L"酸性/毒素";
-    case 8:  return L"闪电/电击";
-    case 9:  return L"活力/活力衰减";
+    case 5:  return L"冰冷";
+    case 6:  return L"火焰";
+    case 7:  return L"酸性";
+    case 8:  return L"闪电";
+    case 9:  return L"活力";
     case 10: return L"混乱";
     case 11: return L"虚化";
     case 12: return L"法力燃烧";
@@ -247,6 +259,26 @@ static const wchar_t *damage_type_wname(unsigned type) {
     }
 }
 
+static const wchar_t *damage_phase_wname(DamagePhase phase, unsigned type) {
+    if (phase == DAMAGE_DOT) {
+        switch (type) {
+        case 2:  return L"创伤";
+        case 5:  return L"霜燃";
+        case 6:  return L"燃烧";
+        case 7:  return L"毒素";
+        case 8:  return L"电击";
+        case 9:  return L"活力衰减";
+        case 15: return L"流血";
+        default: break;
+        }
+    }
+    return damage_type_wname(type);
+}
+
+static const char *damage_phase_name(DamagePhase phase) {
+    return phase == DAMAGE_DOT ? "dot" : "direct";
+}
+
 static const wchar_t *meter_wname(MeterKind kind) {
     switch (kind) {
     case METER_PLAYER_DEALT:    return L"玩家输出 / Dealt damage";
@@ -280,7 +312,7 @@ static void reset_stats(void) {
 }
 
 static void meter_record_locked(DpsMeter *meter, DWORD now,
-    float damage, unsigned type) {
+    float damage, unsigned type, DamagePhase phase) {
     DWORD aligned = now - (now % DPS_BUCKET_MS);
     DpsBucket *bucket = &meter->buckets[meter->bucket_index];
 
@@ -294,15 +326,16 @@ static void meter_record_locked(DpsMeter *meter, DWORD now,
     }
 
     bucket->last_event_ms = now;
-    bucket->damage[type] += damage;
-    meter->type_total[type] += damage;
+    if (phase >= DAMAGE_PHASE_COUNT) phase = DAMAGE_DIRECT;
+    bucket->damage[phase][type] += damage;
+    meter->type_total[phase][type] += damage;
     meter->total_damage += damage;
     meter->event_count++;
 }
 
 static void meter_make_view_locked(DpsMeter *meter, DWORD now,
     MeterView *view) {
-    unsigned i, t;
+    unsigned i, phase, t;
     DWORD oldest_age = 0;
     DWORD newest_age = 0xFFFFFFFFu;
     int have_event = 0;
@@ -310,8 +343,9 @@ static void meter_make_view_locked(DpsMeter *meter, DWORD now,
     DWORD divisor_ms;
 
     memset(view, 0, sizeof(*view));
-    for (t = 0; t < DPS_TYPE_COUNT; ++t)
-        view->type_total[t] = meter->type_total[t];
+    for (phase = 0; phase < DAMAGE_PHASE_COUNT; ++phase)
+        for (t = 0; t < DPS_TYPE_COUNT; ++t)
+            view->type_total[phase][t] = meter->type_total[phase][t];
     view->total_damage = meter->total_damage;
     view->event_count = meter->event_count;
 
@@ -322,8 +356,9 @@ static void meter_make_view_locked(DpsMeter *meter, DWORD now,
         bucket_age = now - bucket->bucket_ms;
         if (bucket_age > DPS_WINDOW_MS) continue;
 
-        for (t = 0; t < DPS_TYPE_COUNT; ++t)
-            view->dps[t] += bucket->damage[t];
+        for (phase = 0; phase < DAMAGE_PHASE_COUNT; ++phase)
+            for (t = 0; t < DPS_TYPE_COUNT; ++t)
+                view->dps[phase][t] += bucket->damage[phase][t];
 
         {
             DWORD first_age = now - bucket->first_event_ms;
@@ -342,9 +377,11 @@ static void meter_make_view_locked(DpsMeter *meter, DWORD now,
 
     if (have_event) {
         float seconds = (float)divisor_ms / 1000.0f;
-        for (t = 0; t < DPS_TYPE_COUNT; ++t) {
-            view->dps[t] /= seconds;
-            view->total_dps += view->dps[t];
+        for (phase = 0; phase < DAMAGE_PHASE_COUNT; ++phase) {
+            for (t = 0; t < DPS_TYPE_COUNT; ++t) {
+                view->dps[phase][t] /= seconds;
+                view->total_dps += view->dps[phase][t];
+            }
         }
     }
 
@@ -379,22 +416,23 @@ static void clear_event_log(void) {
 }
 
 static void record_selected_damage(MeterKind kind, float damage,
-    unsigned type) {
+    unsigned type, DamagePhase phase) {
     DWORD now;
     unsigned event_number;
     int write_debug_log;
 
     if (!(damage > 0.0f)) return;
     if (type >= DPS_TYPE_COUNT) type = DPS_TYPE_COUNT - 1;
+    if (phase >= DAMAGE_PHASE_COUNT) phase = DAMAGE_DIRECT;
     now = GetTickCount();
 
     EnterCriticalSection(&g_dps_cs);
-    meter_record_locked(&g_meters[kind], now, damage, type);
+    meter_record_locked(&g_meters[kind], now, damage, type, phase);
     event_number = ++g_event_count;
     {
         wchar_t *slot = g_evtlog[g_evtlog_head];
         _snwprintf(slot, 192, L"[%-4s] %-7s %10.1f",
-            meter_short_wname(kind), damage_type_wname(type), damage);
+            meter_short_wname(kind), damage_phase_wname(phase, type), damage);
         slot[191] = L'\0';
         g_evtlog_head = (g_evtlog_head + 1) % EVTLOG_N;
         if (g_evtlog_count < EVTLOG_N) g_evtlog_count++;
@@ -406,8 +444,9 @@ static void record_selected_damage(MeterKind kind, float damage,
     if (write_debug_log) {
         char line[192];
         _snprintf(line, sizeof(line),
-            "DPS#%u meter=%u dmg=%.1f type=%u stream=%s",
+            "DPS#%u meter=%u dmg=%.1f type=%u phase=%s stream=%s",
             event_number, (unsigned)kind, damage, type,
+            damage_phase_name(phase),
             InterlockedCompareExchange(&g_use_mitigated, 0, 0)
                 ? "mitigated" : "raw");
         line[sizeof(line) - 1] = '\0';
@@ -427,6 +466,7 @@ typedef struct DamageContext {
     unsigned target_object_id;
     unsigned attacker_master;
     unsigned target_master;
+    DamagePhase phase;
     int mitigated;
     int valid;
 } DamageContext;
@@ -434,6 +474,7 @@ typedef struct DamageContext {
 typedef struct ThreadDamageContexts {
     DamageContext stack[DAMAGE_CONTEXT_DEPTH];
     unsigned depth;
+    unsigned duration_depth;
 } ThreadDamageContexts;
 
 static DWORD g_context_tls = TLS_OUT_OF_INDEXES;
@@ -510,6 +551,11 @@ static DamageContext make_damage_context(void *combatManager,
     if (combatManager)
         target = *(void **)((char *)combatManager + COMBAT_TARGET_OFFSET);
     ctx.target = target;
+    {
+        ThreadDamageContexts *contexts = thread_contexts(0);
+        ctx.phase = contexts && contexts->duration_depth
+            ? DAMAGE_DOT : DAMAGE_DIRECT;
+    }
     ctx.mitigated = (int)InterlockedCompareExchange(&g_use_mitigated, 0, 0);
     ctx.stats_kind = dmgType
         ? *(const unsigned *)((const char *)dmgType + 0) : 0;
@@ -545,11 +591,12 @@ static DamageContext make_damage_context(void *combatManager,
     if (classification_log_number <= 40) {
         char line[256];
         _snprintf(line, sizeof(line),
-            "CLASS#%ld statsKind=%u rawType=0x%08X attr=%u normalized=%u "
+            "CLASS#%ld statsKind=%u rawType=0x%08X attr=%u normalized=%u phase=%s "
             "playerObj=%u attacker=%u targetObj=%u attackerMaster=%u "
             "targetMaster=%u meter=%u target=%p player=%p",
             classification_log_number, ctx.stats_kind, ctx.raw_damage_type,
-            ctx.combat_attr, ctx.damage_type, player_object_id,
+            ctx.combat_attr, ctx.damage_type, damage_phase_name(ctx.phase),
+            player_object_id,
             ctx.attacker_id, ctx.target_object_id, ctx.attacker_master,
             ctx.target_master, (unsigned)ctx.meter, target, (void *)g_player);
         line[sizeof(line) - 1] = '\0';
@@ -603,6 +650,26 @@ static void *__fastcall HK_GetMainPlayer(void *self, void *unused_edx) {
     return player;
 }
 
+/* ExecuteDamage encloses the CombatManager::ApplyDamage calls that apply
+ * periodic ticks. PlayStatsDamageType itself does not encode direct-vs-DOT:
+ * both paths normally use stats_kind == 1 and the same base damage type.
+ * Track this exported call on the current thread so Cold can be shown as
+ * direct "冰冷" while its duration ticks are shown separately as "霜燃". */
+#if defined(_WIN64) || defined(__x86_64__)
+static float HK_ExecuteDurationDamage(void *self, float *accumulated_damage) {
+#else
+static float __fastcall HK_ExecuteDurationDamage(void *self, void *unused_edx,
+    float *accumulated_damage) {
+    (void)unused_edx;
+#endif
+    ThreadDamageContexts *contexts = thread_contexts(1);
+    float result;
+    if (contexts) ++contexts->duration_depth;
+    result = g_OrigExecuteDurationDamage(self, accumulated_damage);
+    if (contexts && contexts->duration_depth) --contexts->duration_depth;
+    return result;
+}
+
 #if defined(_WIN64) || defined(__x86_64__)
 static unsigned char HK_ApplyDamageCM(void *self, float damage,
     const void *dmgType, int attr, const void *vec) {
@@ -616,7 +683,7 @@ static unsigned char __fastcall HK_ApplyDamageCM(void *self, void *unused_edx,
     push_damage_context(ctx);
 
     if (ctx.valid && !ctx.mitigated)
-        record_selected_damage(ctx.meter, damage, ctx.damage_type);
+        record_selected_damage(ctx.meter, damage, ctx.damage_type, ctx.phase);
 
     result = g_OrigApplyDamageCM(self, damage, dmgType, attr, vec);
     pop_damage_context();
@@ -637,7 +704,8 @@ static void __fastcall HK_SubtractLife(void *self, void *unused_edx,
     (void)dmgType; /* DPYes uses the context captured by ApplyDamage. */
     if (ctx && ctx->valid && ctx->mitigated) {
         if (ctx->target == self) {
-            record_selected_damage(ctx->meter, damage, ctx->damage_type);
+            record_selected_damage(ctx->meter, damage, ctx->damage_type,
+                ctx->phase);
         } else if (InterlockedIncrement(&mismatch_logs) <= 10) {
             char line[160];
             _snprintf(line, sizeof(line),
@@ -656,7 +724,7 @@ static void add_list_line(HWND list, const wchar_t *line) {
 
 static void add_meter_lines(HWND list, MeterKind kind, const MeterView *view) {
     wchar_t line[256];
-    unsigned i;
+    unsigned i, phase;
     int any = 0;
 
     _snwprintf(line, 256, L"―― %s ――", meter_wname(kind));
@@ -666,15 +734,19 @@ static void add_meter_lines(HWND list, MeterKind kind, const MeterView *view) {
 
     for (i = 0; i < DPS_TYPE_COUNT; ++i) {
         unsigned type = g_type_order[i];
-        if (view->dps[type] <= 0.05f && view->best_dps[type] <= 0.05f &&
-            view->type_total[type] <= 0.5)
-            continue;
-        any = 1;
-        _snwprintf(line, 256, L"  %-7s %10.0f %10.0f %12.0f",
-            damage_type_wname(type), view->dps[type], view->best_dps[type],
-            view->type_total[type]);
-        line[255] = L'\0';
-        add_list_line(list, line);
+        for (phase = 0; phase < DAMAGE_PHASE_COUNT; ++phase) {
+            if (view->dps[phase][type] <= 0.05f &&
+                view->best_dps[phase][type] <= 0.05f &&
+                view->type_total[phase][type] <= 0.5)
+                continue;
+            any = 1;
+            _snwprintf(line, 256, L"  %-7s %10.0f %10.0f %12.0f",
+                damage_phase_wname((DamagePhase)phase, type),
+                view->dps[phase][type], view->best_dps[phase][type],
+                view->type_total[phase][type]);
+            line[255] = L'\0';
+            add_list_line(list, line);
+        }
     }
 
     if (!any)
@@ -906,7 +978,7 @@ static void *resolve(HMODULE module, const char *symbol, const char *label) {
 static DWORD WINAPI worker(LPVOID unused) {
     HMODULE game = NULL;
     HMODULE engine_module = NULL;
-    void *pGMP, *pApply, *pSubtract;
+    void *pGMP, *pApply, *pSubtract, *pDurationDamage;
     int i;
     (void)unused;
 
@@ -939,6 +1011,8 @@ static DWORD WINAPI worker(LPVOID unused) {
     pGMP = resolve(game, SYM_GetMainPlayer, "GetMainPlayer");
     pApply = resolve(game, SYM_ApplyDamageCM, "CombatManager::ApplyDamage");
     pSubtract = resolve(game, SYM_SubtractLife, "Character::SubtractLife");
+    pDurationDamage = resolve(game, SYM_ExecuteDurationDamage,
+        "DurationDamageManager::ExecuteDamage");
     g_fnGetAttackerIdCM = (GetUInt_t)resolve(game,
         SYM_GetAttackerIdCM, "CombatManager::GetAttackerId");
     /* Object::GetObjectId is imported by Game.dll but exported by
@@ -954,7 +1028,8 @@ static DWORD WINAPI worker(LPVOID unused) {
 
     g_identity_symbols_ready = g_fnGetAttackerIdCM &&
         g_fnGetObjectId && g_fnGetMasterAttacker;
-    if (!pGMP || !pApply || !pSubtract || !g_identity_symbols_ready) {
+    if (!pGMP || !pApply || !pSubtract || !pDurationDamage ||
+        !g_identity_symbols_ready) {
         log_msg("FAIL: required DPS hook/identity symbols missing");
         return 1;
     }
@@ -967,6 +1042,12 @@ static DWORD WINAPI worker(LPVOID unused) {
         (LPVOID *)&g_OrigGetMainPlayer) != MH_OK ||
         MH_EnableHook(pGMP) != MH_OK) {
         log_msg("FAIL: hook GetMainPlayer");
+        return 1;
+    }
+    if (MH_CreateHook(pDurationDamage, (LPVOID)&HK_ExecuteDurationDamage,
+        (LPVOID *)&g_OrigExecuteDurationDamage) != MH_OK ||
+        MH_EnableHook(pDurationDamage) != MH_OK) {
+        log_msg("FAIL: hook DurationDamageManager::ExecuteDamage");
         return 1;
     }
     if (MH_CreateHook(pApply, (LPVOID)&HK_ApplyDamageCM,
@@ -982,7 +1063,7 @@ static DWORD WINAPI worker(LPVOID unused) {
         return 1;
     }
 
-    log_msg("hooks enabled: context classification + selectable raw/mitigated stream");
+    log_msg("hooks enabled: identity classification + direct/DOT + raw/mitigated stream");
     ui_run((HINSTANCE)GetModuleHandleW(NULL));
     return 0;
 }
