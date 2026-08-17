@@ -1,0 +1,8 @@
+# Local build products and runtime diagnostics
+/*.dll
+/dpyes_ext.log*
+/dist/
+
+# Editor/OS noise
+.DS_Store
+Thumbs.db
