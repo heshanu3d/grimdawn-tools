@@ -33,6 +33,16 @@
 #define SYM_GetAttackerIdCM     "?GetAttackerId@CombatManager@GAME@@QEBA?BIXZ"
 #define SYM_GetObjectId         "?GetObjectId@Object@GAME@@QEBAIXZ"
 #define SYM_GetMasterAttacker   "?GetMasterAttacker@GameEngine@GAME@@QEBAII@Z"
+#define SYM_ItemClassInfo       "?GetStaticClassInfo@Item@GAME@@SAAEBVRTTI_ClassInfo@2@XZ"
+#define SYM_BlueprintClassInfo  "?GetStaticClassInfo@ItemArtifactFormula@GAME@@SAAEBVRTTI_ClassInfo@2@XZ"
+#define SYM_LoreClassInfo       "?GetStaticClassInfo@ItemNote@GAME@@SAAEBVRTTI_ClassInfo@2@XZ"
+#define SYM_RelicClassInfo      "?GetStaticClassInfo@ItemRelic@GAME@@SAAEBVRTTI_ClassInfo@2@XZ"
+#define SYM_QuestClassInfo      "?GetStaticClassInfo@QuestItem@GAME@@SAAEBVRTTI_ClassInfo@2@XZ"
+#define SYM_OneShotClassInfo    "?GetStaticClassInfo@OneShot@GAME@@SAAEBVRTTI_ClassInfo@2@XZ"
+#define SYM_GetDropClassification "?GetDropClassification@Item@GAME@@QEBA?AW4ItemClassification@2@XZ"
+#define SYM_PassLootFilter      "?PassLootFilter@Item@GAME@@QEBA_NW4ItemIgnore@InGameUIActorCapture@2@@Z"
+#define ITEM_VTBL_CAN_AUTO_PICKUP 184
+#define ITEM_VTBL_AUTO_RADIUS     185
 #else
 #define GAME_ARCH_NAME          "x86"
 #define GAME_MEMBER_CALL        __thiscall
@@ -46,6 +56,16 @@
 #define SYM_GetAttackerIdCM     "?GetAttackerId@CombatManager@GAME@@QBE?BIXZ"
 #define SYM_GetObjectId         "?GetObjectId@Object@GAME@@QBEIXZ"
 #define SYM_GetMasterAttacker   "?GetMasterAttacker@GameEngine@GAME@@QBEII@Z"
+#define SYM_ItemClassInfo       "?GetStaticClassInfo@Item@GAME@@SAABVRTTI_ClassInfo@2@XZ"
+#define SYM_BlueprintClassInfo  "?GetStaticClassInfo@ItemArtifactFormula@GAME@@SAABVRTTI_ClassInfo@2@XZ"
+#define SYM_LoreClassInfo       "?GetStaticClassInfo@ItemNote@GAME@@SAABVRTTI_ClassInfo@2@XZ"
+#define SYM_RelicClassInfo      "?GetStaticClassInfo@ItemRelic@GAME@@SAABVRTTI_ClassInfo@2@XZ"
+#define SYM_QuestClassInfo      "?GetStaticClassInfo@QuestItem@GAME@@SAABVRTTI_ClassInfo@2@XZ"
+#define SYM_OneShotClassInfo    "?GetStaticClassInfo@OneShot@GAME@@SAABVRTTI_ClassInfo@2@XZ"
+#define SYM_GetDropClassification "?GetDropClassification@Item@GAME@@QBE?AW4ItemClassification@2@XZ"
+#define SYM_PassLootFilter      "?PassLootFilter@Item@GAME@@QBE_NW4ItemIgnore@InGameUIActorCapture@2@@Z"
+#define ITEM_VTBL_CAN_AUTO_PICKUP 185
+#define ITEM_VTBL_AUTO_RADIUS     186
 #endif
 
 #define DPS_TYPE_COUNT       64
@@ -57,6 +77,7 @@
 #define BEST_RETENTION_MS    120000u
 #define DAMAGE_CONTEXT_DEPTH 8
 #define EVTLOG_N             300
+#define AUTOLOOT_VTABLE_MAX  512
 
 #define HOTKEY_TOGGLE 1
 #define TOGGLE_VK     VK_INSERT
@@ -69,8 +90,16 @@
 #define IDC_STATS       200
 #define IDC_RESET       300
 #define IDC_MITIGATED   301
-#define IDC_TRUE_ENV    302
-#define IDC_EVTLOG      400
+#define IDC_TRUE_ENV        302
+#define IDC_AUTOLOOT        303
+#define IDC_LOOT_LORE       304
+#define IDC_LOOT_BLUEPRINTS 305
+#define IDC_LOOT_RELICS     306
+#define IDC_LOOT_ONESHOT    307
+#define IDC_LOOT_QUEST      308
+#define IDC_LOOT_RARES      309
+#define IDC_LOOT_FILTER     310
+#define IDC_EVTLOG          400
 
 static CRITICAL_SECTION g_log_cs;
 static CRITICAL_SECTION g_dps_cs;
@@ -125,6 +154,286 @@ static volatile LONG g_use_mitigated = 1; /* DPYes 18p default: enabled. */
 static volatile LONG g_show_true_environment = 0;
 static volatile LONG g_classification_logs;
 static int g_identity_symbols_ready;
+
+/* ---------------- DPYes-style automatic item pickup ----------------
+ *
+ * Game.dll folds Item::CanAutoPickup and Item::GetAutoPickupRadius into
+ * shared return-false/return-zero stubs. Hooking those code addresses would
+ * therefore change unrelated virtual methods. Instead, patch only the two
+ * slots in Object vtables whose custom GAME RTTI says they derive from Item.
+ * The game's own player update then remains responsible for scanning,
+ * synchronization, item lifetime, inventory checks, and PickupItem calls.
+ */
+typedef const void *(*GetStaticClassInfo_t)(void);
+typedef const void *(GAME_MEMBER_CALL *GetClassInfo_t)(void *self);
+typedef unsigned char (GAME_MEMBER_CALL *CanAutoPickup_t)(void *self);
+typedef float (GAME_MEMBER_CALL *GetAutoPickupRadius_t)(void *self);
+typedef int (GAME_MEMBER_CALL *GetDropClassification_t)(void *self);
+typedef unsigned char (GAME_MEMBER_CALL *PassLootFilter_t)(void *self,
+    int item_ignore);
+
+typedef struct AutoLootVTablePatch {
+    void **vtable;
+    CanAutoPickup_t original_can_auto_pickup;
+    GetAutoPickupRadius_t original_get_radius;
+} AutoLootVTablePatch;
+
+static AutoLootVTablePatch g_autoloot_vtables[AUTOLOOT_VTABLE_MAX];
+static unsigned g_autoloot_vtable_count;
+static const void *g_item_class_info;
+static const void *g_blueprint_class_info;
+static const void *g_lore_class_info;
+static const void *g_relic_class_info;
+static const void *g_quest_class_info;
+static const void *g_one_shot_class_info;
+static GetDropClassification_t g_fnGetDropClassification;
+static PassLootFilter_t g_fnPassLootFilter;
+
+static volatile LONG g_autoloot_enabled;
+static volatile LONG g_autoloot_lore = 1;
+static volatile LONG g_autoloot_blueprints = 1;
+static volatile LONG g_autoloot_relics = 1;
+static volatile LONG g_autoloot_one_shot = 1;
+static volatile LONG g_autoloot_quest = 1;
+static volatile LONG g_autoloot_rares;
+static volatile LONG g_autoloot_filter = 1;
+
+#define AUTOLOOT_RADIUS 3.0f
+
+static void *resolve(HMODULE module, const char *symbol, const char *label);
+
+static int autoloot_flag(const volatile LONG *flag) {
+    return InterlockedCompareExchange((volatile LONG *)flag, 0, 0) != 0;
+}
+
+static int class_is_or_derived(const void *class_info,
+    const void *base_class_info) {
+    unsigned depth = 0;
+    while (class_info && base_class_info && depth++ < 64) {
+        if (class_info == base_class_info)
+            return 1;
+        class_info = *(const void * const *)((const char *)class_info +
+            2 * sizeof(void *));
+    }
+    return 0;
+}
+
+static const void *autoloot_object_class_info(void *self) {
+    void **vtable;
+    GetClassInfo_t get_class_info;
+    if (!self)
+        return NULL;
+    vtable = *(void ***)self;
+    if (!vtable || !vtable[0])
+        return NULL;
+    get_class_info = (GetClassInfo_t)vtable[0];
+    return get_class_info(self);
+}
+
+static AutoLootVTablePatch *autoloot_find_vtable(void **vtable) {
+    unsigned i;
+    for (i = 0; i < g_autoloot_vtable_count; ++i) {
+        if (g_autoloot_vtables[i].vtable == vtable)
+            return &g_autoloot_vtables[i];
+    }
+    return NULL;
+}
+
+static int autoloot_item_selected(void *item) {
+    const void *class_info = autoloot_object_class_info(item);
+    int classification;
+
+    if (!class_info)
+        return 0;
+    if (class_is_or_derived(class_info, g_lore_class_info))
+        return autoloot_flag(&g_autoloot_lore);
+    if (class_is_or_derived(class_info, g_blueprint_class_info))
+        return autoloot_flag(&g_autoloot_blueprints);
+    if (class_is_or_derived(class_info, g_relic_class_info))
+        return autoloot_flag(&g_autoloot_relics);
+    if (class_is_or_derived(class_info, g_quest_class_info))
+        return autoloot_flag(&g_autoloot_quest);
+    if (class_is_or_derived(class_info, g_one_shot_class_info))
+        return autoloot_flag(&g_autoloot_one_shot);
+
+    if (!autoloot_flag(&g_autoloot_rares) || !g_fnGetDropClassification)
+        return 0;
+
+    /* ItemClassification: Common=0, Magical=1, Rare=2, Epic=3,
+     * Legendary=4. Only ordinary equipment reaches this fallback because
+     * the special item classes above are handled before classification. */
+    classification = g_fnGetDropClassification(item);
+    if (classification < 2 || classification > 4)
+        return 0;
+
+    /* ItemIgnore 0 takes Game.dll's full current-player loot-filter path.
+     * DPYes applies filtering to equipment, not to quest/lore/currency. */
+    if (autoloot_flag(&g_autoloot_filter) && g_fnPassLootFilter)
+        return g_fnPassLootFilter(item, 0) != 0;
+    return 1;
+}
+
+#if defined(_WIN64) || defined(__x86_64__)
+static unsigned char AutoLoot_CanAutoPickup(void *self) {
+    AutoLootVTablePatch *patch = autoloot_find_vtable(*(void ***)self);
+    if (autoloot_flag(&g_autoloot_enabled) && autoloot_item_selected(self))
+        return 1;
+    return patch && patch->original_can_auto_pickup
+        ? patch->original_can_auto_pickup(self) : 0;
+}
+
+static float AutoLoot_GetAutoPickupRadius(void *self) {
+    AutoLootVTablePatch *patch = autoloot_find_vtable(*(void ***)self);
+    if (autoloot_flag(&g_autoloot_enabled) && autoloot_item_selected(self))
+        return AUTOLOOT_RADIUS;
+    return patch && patch->original_get_radius
+        ? patch->original_get_radius(self) : 0.0f;
+}
+#else
+static unsigned char __fastcall AutoLoot_CanAutoPickup(void *self,
+    void *unused_edx) {
+    AutoLootVTablePatch *patch;
+    (void)unused_edx;
+    patch = autoloot_find_vtable(*(void ***)self);
+    if (autoloot_flag(&g_autoloot_enabled) && autoloot_item_selected(self))
+        return 1;
+    return patch && patch->original_can_auto_pickup
+        ? patch->original_can_auto_pickup(self) : 0;
+}
+
+static float __fastcall AutoLoot_GetAutoPickupRadius(void *self,
+    void *unused_edx) {
+    AutoLootVTablePatch *patch;
+    (void)unused_edx;
+    patch = autoloot_find_vtable(*(void ***)self);
+    if (autoloot_flag(&g_autoloot_enabled) && autoloot_item_selected(self))
+        return AUTOLOOT_RADIUS;
+    return patch && patch->original_get_radius
+        ? patch->original_get_radius(self) : 0.0f;
+}
+#endif
+
+static int autoloot_patch_vtable(void **vtable) {
+    AutoLootVTablePatch *patch;
+    DWORD old_protect;
+    DWORD ignored;
+    SIZE_T patch_size;
+
+    if (!vtable || autoloot_find_vtable(vtable))
+        return 0;
+    if (g_autoloot_vtable_count >= AUTOLOOT_VTABLE_MAX)
+        return 0;
+
+    patch_size = (ITEM_VTBL_AUTO_RADIUS - ITEM_VTBL_CAN_AUTO_PICKUP + 1) *
+        sizeof(void *);
+    if (!VirtualProtect(&vtable[ITEM_VTBL_CAN_AUTO_PICKUP], patch_size,
+        PAGE_READWRITE, &old_protect))
+        return 0;
+
+    patch = &g_autoloot_vtables[g_autoloot_vtable_count];
+    patch->vtable = vtable;
+    patch->original_can_auto_pickup =
+        (CanAutoPickup_t)vtable[ITEM_VTBL_CAN_AUTO_PICKUP];
+    patch->original_get_radius =
+        (GetAutoPickupRadius_t)vtable[ITEM_VTBL_AUTO_RADIUS];
+
+    /* Publish the fallback entry before either virtual slot can dispatch to
+     * us. Radius is patched first because native CanAutoPickup still gates it. */
+    MemoryBarrier();
+    ++g_autoloot_vtable_count;
+    MemoryBarrier();
+    vtable[ITEM_VTBL_AUTO_RADIUS] = (void *)&AutoLoot_GetAutoPickupRadius;
+    vtable[ITEM_VTBL_CAN_AUTO_PICKUP] = (void *)&AutoLoot_CanAutoPickup;
+
+    VirtualProtect(&vtable[ITEM_VTBL_CAN_AUTO_PICKUP], patch_size,
+        old_protect, &ignored);
+    return 1;
+}
+
+static unsigned autoloot_patch_item_vtables(HMODULE game) {
+    const unsigned char *base = (const unsigned char *)game;
+    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)base;
+    const IMAGE_NT_HEADERS *nt;
+    const IMAGE_DATA_DIRECTORY *directory;
+    const IMAGE_EXPORT_DIRECTORY *exports;
+    const DWORD *names;
+    unsigned i;
+    unsigned patched = 0;
+
+    if (!game || dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return 0;
+    nt = (const IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return 0;
+    directory = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!directory->VirtualAddress || !directory->Size)
+        return 0;
+    exports = (const IMAGE_EXPORT_DIRECTORY *)(base +
+        directory->VirtualAddress);
+    names = (const DWORD *)(base + exports->AddressOfNames);
+
+    for (i = 0; i < exports->NumberOfNames; ++i) {
+        const char *name = (const char *)(base + names[i]);
+        void **vtable;
+        GetClassInfo_t get_class_info;
+        const void *class_info;
+
+        if (strncmp(name, "??_7", 4) != 0 ||
+            !strstr(name, "@GAME@@6BObject@1@@"))
+            continue;
+        vtable = (void **)(void *)GetProcAddress(game, name);
+        if (!vtable || !vtable[0])
+            continue;
+        get_class_info = (GetClassInfo_t)vtable[0];
+        class_info = get_class_info(NULL);
+        if (!class_is_or_derived(class_info, g_item_class_info))
+            continue;
+        patched += (unsigned)autoloot_patch_vtable(vtable);
+    }
+    return patched;
+}
+
+static unsigned autoloot_initialize(HMODULE game) {
+    GetStaticClassInfo_t get_class_info;
+    unsigned patched;
+    char line[160];
+
+#define RESOLVE_CLASS_INFO(target, symbol, label) do { \
+    get_class_info = (GetStaticClassInfo_t)resolve(game, symbol, label); \
+    target = get_class_info ? get_class_info() : NULL; \
+} while (0)
+
+    RESOLVE_CLASS_INFO(g_item_class_info, SYM_ItemClassInfo,
+        "Item::GetStaticClassInfo");
+    RESOLVE_CLASS_INFO(g_blueprint_class_info, SYM_BlueprintClassInfo,
+        "ItemArtifactFormula::GetStaticClassInfo");
+    RESOLVE_CLASS_INFO(g_lore_class_info, SYM_LoreClassInfo,
+        "ItemNote::GetStaticClassInfo");
+    RESOLVE_CLASS_INFO(g_relic_class_info, SYM_RelicClassInfo,
+        "ItemRelic::GetStaticClassInfo");
+    RESOLVE_CLASS_INFO(g_quest_class_info, SYM_QuestClassInfo,
+        "QuestItem::GetStaticClassInfo");
+    RESOLVE_CLASS_INFO(g_one_shot_class_info, SYM_OneShotClassInfo,
+        "OneShot::GetStaticClassInfo");
+#undef RESOLVE_CLASS_INFO
+
+    g_fnGetDropClassification = (GetDropClassification_t)resolve(game,
+        SYM_GetDropClassification, "Item::GetDropClassification");
+    g_fnPassLootFilter = (PassLootFilter_t)resolve(game,
+        SYM_PassLootFilter, "Item::PassLootFilter");
+
+    if (!g_item_class_info) {
+        log_msg("WARN: automatic pickup disabled; Item RTTI unavailable");
+        return 0;
+    }
+    patched = autoloot_patch_item_vtables(game);
+    _snprintf(line, sizeof(line),
+        "automatic pickup ready: %u Item-derived Object vtables patched, radius %.1f",
+        patched, (double)AUTOLOOT_RADIUS);
+    line[sizeof(line) - 1] = '\0';
+    log_msg(line);
+    return patched;
+}
 
 /* ---------------- DPYes-style meter state ---------------- */
 typedef enum DamagePhase {
@@ -855,6 +1164,18 @@ static void refresh_stats(HWND h) {
 #endif
 }
 
+static void autoloot_checkbox_changed(HWND h, int control_id,
+    volatile LONG *setting, const char *label) {
+    int checked = SendMessageW(GetDlgItem(h, control_id), BM_GETCHECK,
+        0, 0) == BST_CHECKED;
+    char line[160];
+    InterlockedExchange(setting, checked ? 1 : 0);
+    _snprintf(line, sizeof(line), "automatic pickup %s: %s", label,
+        checked ? "enabled" : "disabled");
+    line[sizeof(line) - 1] = '\0';
+    log_msg(line);
+}
+
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     (void)l;
     switch (m) {
@@ -892,6 +1213,46 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     : "environment type display: combat attribute");
             }
             return 0;
+        case IDC_AUTOLOOT:
+            if (HIWORD(w) == BN_CLICKED)
+                autoloot_checkbox_changed(h, IDC_AUTOLOOT,
+                    &g_autoloot_enabled, "master switch");
+            return 0;
+        case IDC_LOOT_LORE:
+            if (HIWORD(w) == BN_CLICKED)
+                autoloot_checkbox_changed(h, IDC_LOOT_LORE,
+                    &g_autoloot_lore, "lore items");
+            return 0;
+        case IDC_LOOT_BLUEPRINTS:
+            if (HIWORD(w) == BN_CLICKED)
+                autoloot_checkbox_changed(h, IDC_LOOT_BLUEPRINTS,
+                    &g_autoloot_blueprints, "blueprints");
+            return 0;
+        case IDC_LOOT_RELICS:
+            if (HIWORD(w) == BN_CLICKED)
+                autoloot_checkbox_changed(h, IDC_LOOT_RELICS,
+                    &g_autoloot_relics, "components/relics");
+            return 0;
+        case IDC_LOOT_ONESHOT:
+            if (HIWORD(w) == BN_CLICKED)
+                autoloot_checkbox_changed(h, IDC_LOOT_ONESHOT,
+                    &g_autoloot_one_shot, "iron/one-shot items");
+            return 0;
+        case IDC_LOOT_QUEST:
+            if (HIWORD(w) == BN_CLICKED)
+                autoloot_checkbox_changed(h, IDC_LOOT_QUEST,
+                    &g_autoloot_quest, "quest items");
+            return 0;
+        case IDC_LOOT_RARES:
+            if (HIWORD(w) == BN_CLICKED)
+                autoloot_checkbox_changed(h, IDC_LOOT_RARES,
+                    &g_autoloot_rares, "rare-or-better equipment");
+            return 0;
+        case IDC_LOOT_FILTER:
+            if (HIWORD(w) == BN_CLICKED)
+                autoloot_checkbox_changed(h, IDC_LOOT_FILTER,
+                    &g_autoloot_filter, "game loot filter");
+            return 0;
         }
         break;
     case WM_HOTKEY:
@@ -911,6 +1272,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 static void ui_run(HINSTANCE hInst) {
     WNDCLASSW wc;
     HWND h, list, reset, mitigated, true_env;
+    HWND autoloot, loot_lore, loot_blueprints, loot_relics;
+    HWND loot_one_shot, loot_quest, loot_rares, loot_filter;
 #if ENABLE_DAMAGE_LOG_UI
     HWND elog, label;
 #endif
@@ -926,7 +1289,7 @@ static void ui_run(HINSTANCE hInst) {
     RegisterClassW(&wc);
 
     h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, wc.lpszClassName,
-        L"dpyes-ext — DPYes-aligned DPS", WS_OVERLAPPEDWINDOW,
+        L"dpyes-ext — DPS + 自动拾取", WS_OVERLAPPEDWINDOW,
 #if ENABLE_DAMAGE_LOG_UI
         40, 40, 980, 650, NULL, NULL, hInst, NULL);
 #else
@@ -936,50 +1299,118 @@ static void ui_run(HINSTANCE hInst) {
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
         LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
 #if ENABLE_DAMAGE_LOG_UI
-        8, 8, 580, 550, h, (HMENU)IDC_STATS, hInst, NULL);
+        8, 8, 580, 500, h, (HMENU)IDC_STATS, hInst, NULL);
 #else
-        8, 8, 464, 398, h, (HMENU)IDC_STATS, hInst, NULL);
+        8, 8, 464, 298, h, (HMENU)IDC_STATS, hInst, NULL);
 #endif
 #if ENABLE_DAMAGE_LOG_UI
     /* Right-side per-hit damage log UI (temporarily disabled). */
     elog = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", NULL,
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOINTEGRALHEIGHT,
-        596, 8, 360, 550, h, (HMENU)IDC_EVTLOG, hInst, NULL);
+        596, 8, 360, 500, h, (HMENU)IDC_EVTLOG, hInst, NULL);
 #endif
     reset = CreateWindowExW(0, L"BUTTON", L"重置 DPS",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
 #if ENABLE_DAMAGE_LOG_UI
-        8, 566, 100, 28, h, (HMENU)IDC_RESET, hInst, NULL);
+        8, 516, 88, 26, h, (HMENU)IDC_RESET, hInst, NULL);
 #else
-        8, 414, 88, 26, h, (HMENU)IDC_RESET, hInst, NULL);
+        8, 314, 80, 26, h, (HMENU)IDC_RESET, hInst, NULL);
 #endif
     mitigated = CreateWindowExW(0, L"BUTTON", L"减伤后实际伤害",
         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
 #if ENABLE_DAMAGE_LOG_UI
-        120, 568, 145, 24, h, (HMENU)IDC_MITIGATED, hInst, NULL);
+        104, 518, 132, 22, h, (HMENU)IDC_MITIGATED, hInst, NULL);
 #else
-        104, 416, 132, 22, h, (HMENU)IDC_MITIGATED, hInst, NULL);
+        96, 316, 132, 22, h, (HMENU)IDC_MITIGATED, hInst, NULL);
 #endif
     true_env = CreateWindowExW(0, L"BUTTON", L"显示真实环境类型",
         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
 #if ENABLE_DAMAGE_LOG_UI
-        275, 568, 155, 24, h, (HMENU)IDC_TRUE_ENV, hInst, NULL);
+        242, 518, 145, 22, h, (HMENU)IDC_TRUE_ENV, hInst, NULL);
 #else
-        242, 416, 145, 22, h, (HMENU)IDC_TRUE_ENV, hInst, NULL);
+        234, 316, 145, 22, h, (HMENU)IDC_TRUE_ENV, hInst, NULL);
+#endif
+    autoloot = CreateWindowExW(0, L"BUTTON", L"启用自动拾取（半径 3 米）",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+#if ENABLE_DAMAGE_LOG_UI
+        8, 546, 190, 22, h, (HMENU)IDC_AUTOLOOT, hInst, NULL);
+#else
+        8, 344, 190, 22, h, (HMENU)IDC_AUTOLOOT, hInst, NULL);
+#endif
+    loot_lore = CreateWindowExW(0, L"BUTTON", L"文献",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+#if ENABLE_DAMAGE_LOG_UI
+        8, 570, 64, 22, h, (HMENU)IDC_LOOT_LORE, hInst, NULL);
+#else
+        8, 368, 64, 22, h, (HMENU)IDC_LOOT_LORE, hInst, NULL);
+#endif
+    loot_blueprints = CreateWindowExW(0, L"BUTTON", L"蓝图",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+#if ENABLE_DAMAGE_LOG_UI
+        76, 570, 64, 22, h, (HMENU)IDC_LOOT_BLUEPRINTS, hInst, NULL);
+#else
+        76, 368, 64, 22, h, (HMENU)IDC_LOOT_BLUEPRINTS, hInst, NULL);
+#endif
+    loot_relics = CreateWindowExW(0, L"BUTTON", L"组件/遗物",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+#if ENABLE_DAMAGE_LOG_UI
+        144, 570, 96, 22, h, (HMENU)IDC_LOOT_RELICS, hInst, NULL);
+#else
+        144, 368, 96, 22, h, (HMENU)IDC_LOOT_RELICS, hInst, NULL);
+#endif
+    loot_one_shot = CreateWindowExW(0, L"BUTTON", L"金币/药水等",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+#if ENABLE_DAMAGE_LOG_UI
+        244, 570, 112, 22, h, (HMENU)IDC_LOOT_ONESHOT, hInst, NULL);
+#else
+        244, 368, 112, 22, h, (HMENU)IDC_LOOT_ONESHOT, hInst, NULL);
+#endif
+    loot_quest = CreateWindowExW(0, L"BUTTON", L"任务物品",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+#if ENABLE_DAMAGE_LOG_UI
+        360, 570, 96, 22, h, (HMENU)IDC_LOOT_QUEST, hInst, NULL);
+#else
+        360, 368, 96, 22, h, (HMENU)IDC_LOOT_QUEST, hInst, NULL);
+#endif
+    loot_rares = CreateWindowExW(0, L"BUTTON", L"稀有/史诗/传奇装备",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+#if ENABLE_DAMAGE_LOG_UI
+        8, 594, 160, 22, h, (HMENU)IDC_LOOT_RARES, hInst, NULL);
+#else
+        8, 392, 160, 22, h, (HMENU)IDC_LOOT_RARES, hInst, NULL);
+#endif
+    loot_filter = CreateWindowExW(0, L"BUTTON", L"装备使用游戏拾取过滤器",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+#if ENABLE_DAMAGE_LOG_UI
+        176, 594, 190, 22, h, (HMENU)IDC_LOOT_FILTER, hInst, NULL);
+#else
+        176, 392, 190, 22, h, (HMENU)IDC_LOOT_FILTER, hInst, NULL);
 #endif
 #if ENABLE_DAMAGE_LOG_UI
     label = CreateWindowExW(0, L"STATIC",
         L"右侧：已进入 DPS meter 的单一口径事件（Insert 显示/隐藏）",
         WS_CHILD | WS_VISIBLE,
-        596, 570, 360, 22, h, (HMENU)401, hInst, NULL);
+        596, 516, 360, 22, h, (HMENU)401, hInst, NULL);
 #endif
 
+#define SET_CHECKBOX(control, setting) \
+    SendMessageW(control, BM_SETCHECK, autoloot_flag(setting) \
+        ? BST_CHECKED : BST_UNCHECKED, 0)
     SendMessageW(mitigated, BM_SETCHECK,
         InterlockedCompareExchange(&g_use_mitigated, 0, 0)
             ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(true_env, BM_SETCHECK,
         InterlockedCompareExchange(&g_show_true_environment, 0, 0)
             ? BST_CHECKED : BST_UNCHECKED, 0);
+    SET_CHECKBOX(autoloot, &g_autoloot_enabled);
+    SET_CHECKBOX(loot_lore, &g_autoloot_lore);
+    SET_CHECKBOX(loot_blueprints, &g_autoloot_blueprints);
+    SET_CHECKBOX(loot_relics, &g_autoloot_relics);
+    SET_CHECKBOX(loot_one_shot, &g_autoloot_one_shot);
+    SET_CHECKBOX(loot_quest, &g_autoloot_quest);
+    SET_CHECKBOX(loot_rares, &g_autoloot_rares);
+    SET_CHECKBOX(loot_filter, &g_autoloot_filter);
+#undef SET_CHECKBOX
 
     font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     if (font) {
@@ -990,6 +1421,14 @@ static void ui_run(HINSTANCE hInst) {
         SendMessageW(reset, WM_SETFONT, (WPARAM)font, TRUE);
         SendMessageW(mitigated, WM_SETFONT, (WPARAM)font, TRUE);
         SendMessageW(true_env, WM_SETFONT, (WPARAM)font, TRUE);
+        SendMessageW(autoloot, WM_SETFONT, (WPARAM)font, TRUE);
+        SendMessageW(loot_lore, WM_SETFONT, (WPARAM)font, TRUE);
+        SendMessageW(loot_blueprints, WM_SETFONT, (WPARAM)font, TRUE);
+        SendMessageW(loot_relics, WM_SETFONT, (WPARAM)font, TRUE);
+        SendMessageW(loot_one_shot, WM_SETFONT, (WPARAM)font, TRUE);
+        SendMessageW(loot_quest, WM_SETFONT, (WPARAM)font, TRUE);
+        SendMessageW(loot_rares, WM_SETFONT, (WPARAM)font, TRUE);
+        SendMessageW(loot_filter, WM_SETFONT, (WPARAM)font, TRUE);
 #if ENABLE_DAMAGE_LOG_UI
         SendMessageW(label, WM_SETFONT, (WPARAM)font, TRUE);
 #endif
@@ -997,7 +1436,7 @@ static void ui_run(HINSTANCE hInst) {
 
     SetTimer(h, 1, UI_TIMER_MS, NULL);
     RegisterHotKey(h, HOTKEY_TOGGLE, 0, TOGGLE_VK);
-    log_msg("UI up: four DPYes-style meters; INSERT toggles");
+    log_msg("UI up: four DPYes-style meters + automatic pickup; INSERT toggles");
 
     for (;;) {
         MSG msg;
@@ -1084,6 +1523,11 @@ static DWORD WINAPI worker(LPVOID unused) {
         log_msg("FAIL: required DPS hook/identity symbols missing");
         return 1;
     }
+
+    /* Vtable patching is independent of MinHook and deliberately preserves
+     * each class's original behavior whenever dpyes-ext autoloot is off or
+     * an item category is not selected. */
+    autoloot_initialize(game);
 
     if (MH_Initialize() != MH_OK) {
         log_msg("FAIL: MH_Initialize");
