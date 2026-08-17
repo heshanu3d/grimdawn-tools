@@ -172,6 +172,15 @@ typedef struct MeterView {
     unsigned event_count;
 } MeterView;
 
+typedef struct DamageDisplayRow {
+    unsigned type;
+    DamagePhase phase;
+    float dps;
+    float best_dps;
+    double total;
+    unsigned stable_order;
+} DamageDisplayRow;
+
 static DpsMeter g_meters[METER_COUNT];
 static unsigned g_event_count;
 
@@ -723,33 +732,59 @@ static void add_list_line(HWND list, const wchar_t *line) {
 }
 
 static void add_meter_lines(HWND list, MeterKind kind, const MeterView *view) {
+    DamageDisplayRow rows[DPS_TYPE_COUNT * DAMAGE_PHASE_COUNT];
     wchar_t line[256];
-    unsigned i, phase;
-    int any = 0;
+    unsigned i, phase, row_count = 0;
 
     _snwprintf(line, 256, L"―― %s ――", meter_wname(kind));
     line[255] = L'\0';
     add_list_line(list, line);
     add_list_line(list, L"  类型             DPS       Best        Total");
 
+    /* Keep DPYes's type order as the stable tie-breaker, but rank every
+     * direct/DOT row by its current rolling-window DPS. */
     for (i = 0; i < DPS_TYPE_COUNT; ++i) {
         unsigned type = g_type_order[i];
         for (phase = 0; phase < DAMAGE_PHASE_COUNT; ++phase) {
+            DamageDisplayRow *row;
             if (view->dps[phase][type] <= 0.05f &&
                 view->best_dps[phase][type] <= 0.05f &&
                 view->type_total[phase][type] <= 0.5)
                 continue;
-            any = 1;
-            _snwprintf(line, 256, L"  %-7s %10.0f %10.0f %12.0f",
-                damage_phase_wname((DamagePhase)phase, type),
-                view->dps[phase][type], view->best_dps[phase][type],
-                view->type_total[phase][type]);
-            line[255] = L'\0';
-            add_list_line(list, line);
+            row = &rows[row_count++];
+            row->type = type;
+            row->phase = (DamagePhase)phase;
+            row->dps = view->dps[phase][type];
+            row->best_dps = view->best_dps[phase][type];
+            row->total = view->type_total[phase][type];
+            row->stable_order = i * DAMAGE_PHASE_COUNT + phase;
         }
     }
 
-    if (!any)
+    /* There are at most 128 rows, so a stable insertion sort is sufficient. */
+    for (i = 1; i < row_count; ++i) {
+        DamageDisplayRow key = rows[i];
+        unsigned j = i;
+        while (j > 0 &&
+            (rows[j - 1].dps < key.dps ||
+             (rows[j - 1].dps == key.dps &&
+              rows[j - 1].stable_order > key.stable_order))) {
+            rows[j] = rows[j - 1];
+            --j;
+        }
+        rows[j] = key;
+    }
+
+    for (i = 0; i < row_count; ++i) {
+        const DamageDisplayRow *row = &rows[i];
+        _snwprintf(line, 256, L"  %-7s %10.0f %10.0f %12.0f",
+            damage_phase_wname(row->phase, row->type),
+            row->dps, row->best_dps, row->total);
+        line[255] = L'\0';
+        add_list_line(list, line);
+    }
+
+    if (!row_count)
         add_list_line(list, L"  （暂无伤害）");
     _snwprintf(line, 256,
         L"  合计      %10.0f %10.0f %12.0f  [%u事件/跨度%.1fs]",
@@ -895,12 +930,16 @@ static void ui_run(HINSTANCE hInst) {
 #if ENABLE_DAMAGE_LOG_UI
         40, 40, 980, 650, NULL, NULL, hInst, NULL);
 #else
-        40, 40, 620, 650, NULL, NULL, hInst, NULL);
+        40, 40, 500, 500, NULL, NULL, hInst, NULL);
 #endif
     list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", NULL,
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
         LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+#if ENABLE_DAMAGE_LOG_UI
         8, 8, 580, 550, h, (HMENU)IDC_STATS, hInst, NULL);
+#else
+        8, 8, 464, 398, h, (HMENU)IDC_STATS, hInst, NULL);
+#endif
 #if ENABLE_DAMAGE_LOG_UI
     /* Right-side per-hit damage log UI (temporarily disabled). */
     elog = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", NULL,
@@ -909,13 +948,25 @@ static void ui_run(HINSTANCE hInst) {
 #endif
     reset = CreateWindowExW(0, L"BUTTON", L"重置 DPS",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+#if ENABLE_DAMAGE_LOG_UI
         8, 566, 100, 28, h, (HMENU)IDC_RESET, hInst, NULL);
+#else
+        8, 414, 88, 26, h, (HMENU)IDC_RESET, hInst, NULL);
+#endif
     mitigated = CreateWindowExW(0, L"BUTTON", L"减伤后实际伤害",
         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+#if ENABLE_DAMAGE_LOG_UI
         120, 568, 145, 24, h, (HMENU)IDC_MITIGATED, hInst, NULL);
+#else
+        104, 416, 132, 22, h, (HMENU)IDC_MITIGATED, hInst, NULL);
+#endif
     true_env = CreateWindowExW(0, L"BUTTON", L"显示真实环境类型",
         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+#if ENABLE_DAMAGE_LOG_UI
         275, 568, 155, 24, h, (HMENU)IDC_TRUE_ENV, hInst, NULL);
+#else
+        242, 416, 145, 22, h, (HMENU)IDC_TRUE_ENV, hInst, NULL);
+#endif
 #if ENABLE_DAMAGE_LOG_UI
     label = CreateWindowExW(0, L"STATIC",
         L"右侧：已进入 DPS meter 的单一口径事件（Insert 显示/隐藏）",
