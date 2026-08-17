@@ -742,7 +742,7 @@ static void add_meter_lines(HWND list, MeterKind kind, const MeterView *view) {
     add_list_line(list, L"  类型             DPS       Best        Total");
 
     /* Keep DPYes's type order as the stable tie-breaker, but rank every
-     * direct/DOT row by its current rolling-window DPS. */
+     * direct/DOT row by its accumulated total damage. */
     for (i = 0; i < DPS_TYPE_COUNT; ++i) {
         unsigned type = g_type_order[i];
         for (phase = 0; phase < DAMAGE_PHASE_COUNT; ++phase) {
@@ -766,8 +766,8 @@ static void add_meter_lines(HWND list, MeterKind kind, const MeterView *view) {
         DamageDisplayRow key = rows[i];
         unsigned j = i;
         while (j > 0 &&
-            (rows[j - 1].dps < key.dps ||
-             (rows[j - 1].dps == key.dps &&
+            (rows[j - 1].total < key.total ||
+             (rows[j - 1].total == key.total &&
               rows[j - 1].stable_order > key.stable_order))) {
             rows[j] = rows[j - 1];
             --j;
