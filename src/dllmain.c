@@ -174,23 +174,73 @@ static const unsigned char g_type_order[DPS_TYPE_COUNT] = {
 static wchar_t g_unknown_type_names[DPS_TYPE_COUNT][16];
 
 static const wchar_t *damage_type_wname(unsigned type) {
+    /* Game.dll's CombatAttributeType values are one-based. Periodic damage
+     * shares its base type with the corresponding direct damage in DPYes:
+     * e.g. Frostburn is accumulated in Cold, and Poison in Acid. */
     switch (type) {
     case 0:  return L"环境";
-    case 1:  return L"穿刺";
-    case 2:  return L"物理";
-    case 3:  return L"火焰";
-    case 4:  return L"冰冷";
-    case 5:  return L"闪电";
-    case 6:  return L"活力";
-    case 7:  return L"虚化";
-    case 8:  return L"混乱";
-    case 9:  return L"酸性";
-    case 10: return L"创伤";
-    case 11: return L"生命偷取";
-    case 12: return L"霜燃";
-    case 13: return L"燃烧";
-    case 14: return L"电击";
+    case 1:  return L"物理穿刺";
+    case 2:  return L"物理/创伤";
+    case 3:  return L"穿刺比例";
+    case 4:  return L"穿刺";
+    case 5:  return L"冰冷/霜燃";
+    case 6:  return L"火焰/燃烧";
+    case 7:  return L"酸性/毒素";
+    case 8:  return L"闪电/电击";
+    case 9:  return L"活力/活力衰减";
+    case 10: return L"混乱";
+    case 11: return L"虚化";
+    case 12: return L"法力燃烧";
+    case 13: return L"技能打断";
+    case 14: return L"当前生命百分比";
     case 15: return L"流血";
+    case 16: return L"总速度";
+    case 17: return L"攻击速度";
+    case 18: return L"施法速度";
+    case 19: return L"移动速度";
+    case 20: return L"生命偷取";
+    case 21: return L"法力偷取";
+    case 22: return L"攻击能力";
+    case 23: return L"防御能力";
+    case 24: return L"攻击能力降低";
+    case 25: return L"防御能力降低";
+    case 26: return L"近战失误";
+    case 27: return L"远程失误";
+    case 28: return L"总伤害降低%";
+    case 29: return L"总伤害降低";
+    case 30: return L"物理伤害降低%";
+    case 31: return L"元素伤害降低%";
+    case 32: return L"总抗性降低%";
+    case 33: return L"总抗性降低";
+    case 34: return L"物理抗性降低%";
+    case 35: return L"物理抗性降低";
+    case 36: return L"元素抗性降低%";
+    case 37: return L"元素抗性降低";
+    case 38: return L"吸收保护";
+    case 39: return L"伤害吸收";
+    case 40: return L"保护";
+    case 41: return L"护甲";
+    case 42: return L"眩晕";
+    case 43: return L"睡眠";
+    case 44: return L"陷阱";
+    case 45: return L"冻结";
+    case 46: return L"石化";
+    case 47: return L"定身";
+    case 48: return L"击倒";
+    case 49: return L"受击";
+    case 50: return L"嘲讽";
+    case 51: return L"转换";
+    case 52: return L"恐惧";
+    case 53: return L"混乱控制";
+    case 54: return L"未知54";
+    case 55: return L"格挡修正";
+    case 56: return L"格挡量修正";
+    case 57: return L"反射";
+    case 58: return L"元素组";
+    case 59: return L"暴击伤害修正";
+    case 60: return L"总伤害修正";
+    case 61: return L"未知61";
+    case 62: return L"法力燃烧比例";
     default:
         if (type >= DPS_TYPE_COUNT) type = DPS_TYPE_COUNT - 1;
         return g_unknown_type_names[type];
@@ -370,6 +420,9 @@ typedef struct DamageContext {
     void *target;
     MeterKind meter;
     unsigned damage_type;
+    unsigned stats_kind;
+    unsigned raw_damage_type;
+    unsigned combat_attr;
     unsigned attacker_id;
     unsigned target_object_id;
     unsigned attacker_master;
@@ -405,12 +458,13 @@ static unsigned read_damage_type(const void *dmgType, unsigned attr,
     unsigned type = 0;
     if (dmgType)
         type = *(const unsigned *)((const char *)dmgType + 4);
-    type &= 0x7FFFFFFFu;
 
-    /* DPYes normally uses PlayStatsDamageType+4. For environment (zero),
-     * it uses CombatAttributeType unless true-environment display is enabled. */
+    /* DPYes normally uses PlayStatsDamageType+4 verbatim. For environment
+     * (zero), it uses CombatAttributeType unless true-environment display is
+     * enabled. Keep only our bounds clamp, so unexpected values cannot index
+     * beyond the local 64-slot meter. */
     if (type == 0 && !show_true_environment)
-        type = attr & 0x7FFFFFFFu;
+        type = attr;
     if (type >= DPS_TYPE_COUNT)
         type = DPS_TYPE_COUNT - 1;
     return type;
@@ -457,6 +511,11 @@ static DamageContext make_damage_context(void *combatManager,
         target = *(void **)((char *)combatManager + COMBAT_TARGET_OFFSET);
     ctx.target = target;
     ctx.mitigated = (int)InterlockedCompareExchange(&g_use_mitigated, 0, 0);
+    ctx.stats_kind = dmgType
+        ? *(const unsigned *)((const char *)dmgType + 0) : 0;
+    ctx.raw_damage_type = dmgType
+        ? *(const unsigned *)((const char *)dmgType + 4) : 0;
+    ctx.combat_attr = attr;
     ctx.damage_type = read_damage_type(dmgType, attr, show_true_environment);
 
     if (g_fnGetObjectId && g_player) {
@@ -486,11 +545,13 @@ static DamageContext make_damage_context(void *combatManager,
     if (classification_log_number <= 40) {
         char line[256];
         _snprintf(line, sizeof(line),
-            "CLASS#%ld playerObj=%u attacker=%u targetObj=%u "
-            "attackerMaster=%u targetMaster=%u meter=%u target=%p player=%p",
-            classification_log_number, player_object_id, ctx.attacker_id,
-            ctx.target_object_id, ctx.attacker_master, ctx.target_master,
-            (unsigned)ctx.meter, target, (void *)g_player);
+            "CLASS#%ld statsKind=%u rawType=0x%08X attr=%u normalized=%u "
+            "playerObj=%u attacker=%u targetObj=%u attackerMaster=%u "
+            "targetMaster=%u meter=%u target=%p player=%p",
+            classification_log_number, ctx.stats_kind, ctx.raw_damage_type,
+            ctx.combat_attr, ctx.damage_type, player_object_id,
+            ctx.attacker_id, ctx.target_object_id, ctx.attacker_master,
+            ctx.target_master, (unsigned)ctx.meter, target, (void *)g_player);
         line[sizeof(line) - 1] = '\0';
         log_msg(line);
     }
