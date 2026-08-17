@@ -1,4 +1,4 @@
-/* dpyes-ext — external-UI reimplementation of DPYes DPS meters for Grim Dawn x64.
+/* dpyes-ext — external-UI reimplementation of DPYes DPS meters for Grim Dawn.
  *
  * DPS behavior aligned with DPYes 18p:
  *   - CombatManager::ApplyDamage captures attacker/target ownership context.
@@ -19,6 +19,10 @@
 #define LOG_PREFIX "GDEXT: "
 #define LOG_FILE ("\\\\?\\D:\\Game\\grimdawn.Build.24346246\\dpyes-ext\\dpyes_ext.log")
 
+#if defined(_WIN64) || defined(__x86_64__)
+#define GAME_ARCH_NAME          "x64"
+#define GAME_MEMBER_CALL
+#define COMBAT_TARGET_OFFSET    8
 #define SYM_GetMainPlayer       "?GetMainPlayer@GameEngine@GAME@@QEBAPEAVPlayer@2@XZ"
 #define SYM_GetCurrentLife      "?GetCurrentLife@Character@GAME@@QEBA?BNXZ"
 #define SYM_GetExperiencePoints "?GetExperiencePoints@Character@GAME@@QEBA?BIXZ"
@@ -27,6 +31,19 @@
 #define SYM_GetAttackerIdCM     "?GetAttackerId@CombatManager@GAME@@QEBA?BIXZ"
 #define SYM_GetObjectId         "?GetObjectId@Object@GAME@@QEBAIXZ"
 #define SYM_GetMasterAttacker   "?GetMasterAttacker@GameEngine@GAME@@QEBAII@Z"
+#else
+#define GAME_ARCH_NAME          "x86"
+#define GAME_MEMBER_CALL        __thiscall
+#define COMBAT_TARGET_OFFSET    4
+#define SYM_GetMainPlayer       "?GetMainPlayer@GameEngine@GAME@@QBEPAVPlayer@2@XZ"
+#define SYM_GetCurrentLife      "?GetCurrentLife@Character@GAME@@QBE?BNXZ"
+#define SYM_GetExperiencePoints "?GetExperiencePoints@Character@GAME@@QBE?BIXZ"
+#define SYM_ApplyDamageCM       "?ApplyDamage@CombatManager@GAME@@QAE_NMABUPlayStatsDamageType@2@W4CombatAttributeType@2@ABV?$vector@I@mem@@@Z"
+#define SYM_SubtractLife        "?SubtractLife@Character@GAME@@QAEXMABUPlayStatsDamageType@2@_N_N@Z"
+#define SYM_GetAttackerIdCM     "?GetAttackerId@CombatManager@GAME@@QBE?BIXZ"
+#define SYM_GetObjectId         "?GetObjectId@Object@GAME@@QBEIXZ"
+#define SYM_GetMasterAttacker   "?GetMasterAttacker@GameEngine@GAME@@QBEII@Z"
+#endif
 
 #define DPS_TYPE_COUNT       64
 #define DPS_BUCKET_COUNT     10
@@ -76,13 +93,14 @@ static void log_msg(const char *msg) {
 }
 
 /* ---------------- Game.dll functions and captured objects ---------------- */
-typedef void* (*GetMainPlayer_t)(void *self);
-typedef double (*GetDouble_t)(void *self);
-typedef unsigned (*GetUInt_t)(void *self);
-typedef unsigned (*GetMasterAttacker_t)(void *engine, unsigned objectId);
-typedef unsigned char (*ApplyDamageCM_t)(void *self, float damage,
+typedef void* (GAME_MEMBER_CALL *GetMainPlayer_t)(void *self);
+typedef double (GAME_MEMBER_CALL *GetDouble_t)(void *self);
+typedef unsigned (GAME_MEMBER_CALL *GetUInt_t)(void *self);
+typedef unsigned (GAME_MEMBER_CALL *GetMasterAttacker_t)(void *engine,
+    unsigned objectId);
+typedef unsigned char (GAME_MEMBER_CALL *ApplyDamageCM_t)(void *self, float damage,
     const void *dmgType, int attr, const void *vec);
-typedef void (*SubtractLife_t)(void *self, float damage,
+typedef void (GAME_MEMBER_CALL *SubtractLife_t)(void *self, float damage,
     const void *dmgType, unsigned char a, unsigned char b);
 
 static GetMainPlayer_t g_OrigGetMainPlayer;
@@ -436,7 +454,7 @@ static DamageContext make_damage_context(void *combatManager,
 
     memset(&ctx, 0, sizeof(ctx));
     if (combatManager)
-        target = *(void **)((char *)combatManager + 8);
+        target = *(void **)((char *)combatManager + COMBAT_TARGET_OFFSET);
     ctx.target = target;
     ctx.mitigated = (int)InterlockedCompareExchange(&g_use_mitigated, 0, 0);
     ctx.damage_type = read_damage_type(dmgType, attr, show_true_environment);
@@ -507,7 +525,12 @@ static DamageContext *current_damage_context(void) {
     return &contexts->stack[contexts->depth - 1];
 }
 
+#if defined(_WIN64) || defined(__x86_64__)
 static void *HK_GetMainPlayer(void *self) {
+#else
+static void *__fastcall HK_GetMainPlayer(void *self, void *unused_edx) {
+    (void)unused_edx;
+#endif
     void *player = g_OrigGetMainPlayer ? g_OrigGetMainPlayer(self) : NULL;
     g_engine = self;
     if (player) {
@@ -519,8 +542,14 @@ static void *HK_GetMainPlayer(void *self) {
     return player;
 }
 
+#if defined(_WIN64) || defined(__x86_64__)
 static unsigned char HK_ApplyDamageCM(void *self, float damage,
     const void *dmgType, int attr, const void *vec) {
+#else
+static unsigned char __fastcall HK_ApplyDamageCM(void *self, void *unused_edx,
+    float damage, const void *dmgType, int attr, const void *vec) {
+    (void)unused_edx;
+#endif
     DamageContext ctx = make_damage_context(self, dmgType, (unsigned)attr);
     unsigned char result;
     push_damage_context(ctx);
@@ -533,8 +562,14 @@ static unsigned char HK_ApplyDamageCM(void *self, float damage,
     return result;
 }
 
+#if defined(_WIN64) || defined(__x86_64__)
 static void HK_SubtractLife(void *self, float damage, const void *dmgType,
     unsigned char a, unsigned char b) {
+#else
+static void __fastcall HK_SubtractLife(void *self, void *unused_edx,
+    float damage, const void *dmgType, unsigned char a, unsigned char b) {
+    (void)unused_edx;
+#endif
     DamageContext *ctx = current_damage_context();
     static volatile LONG mismatch_logs;
 
@@ -813,7 +848,13 @@ static DWORD WINAPI worker(LPVOID unused) {
     int i;
     (void)unused;
 
-    log_msg("DPYes-aligned worker up; locating Game.dll...");
+    {
+        char line[96];
+        _snprintf(line, sizeof(line),
+            "DPYes-aligned %s worker up; locating Game.dll...", GAME_ARCH_NAME);
+        line[sizeof(line) - 1] = '\0';
+        log_msg(line);
+    }
     for (i = 0; i < 60 && !game; ++i) {
         game = GetModuleHandleW(L"Game.dll");
         Sleep(1000);
