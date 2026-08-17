@@ -905,6 +905,7 @@ static void *resolve(HMODULE module, const char *symbol, const char *label) {
 
 static DWORD WINAPI worker(LPVOID unused) {
     HMODULE game = NULL;
+    HMODULE engine_module = NULL;
     void *pGMP, *pApply, *pSubtract;
     int i;
     (void)unused;
@@ -912,16 +913,22 @@ static DWORD WINAPI worker(LPVOID unused) {
     {
         char line[96];
         _snprintf(line, sizeof(line),
-            "DPYes-aligned %s worker up; locating Game.dll...", GAME_ARCH_NAME);
+            "DPYes-aligned %s worker up; locating Game.dll and Engine.dll...",
+            GAME_ARCH_NAME);
         line[sizeof(line) - 1] = '\0';
         log_msg(line);
     }
-    for (i = 0; i < 60 && !game; ++i) {
-        game = GetModuleHandleW(L"Game.dll");
-        Sleep(1000);
+    for (i = 0; i < 60 && (!game || !engine_module); ++i) {
+        if (!game) game = GetModuleHandleW(L"Game.dll");
+        if (!engine_module) engine_module = GetModuleHandleW(L"Engine.dll");
+        if (!game || !engine_module) Sleep(1000);
     }
     if (!game) {
         log_msg("FAIL: Game.dll not found after 60s");
+        return 1;
+    }
+    if (!engine_module) {
+        log_msg("FAIL: Engine.dll not found after 60s");
         return 1;
     }
     if (g_context_tls == TLS_OUT_OF_INDEXES) {
@@ -934,8 +941,10 @@ static DWORD WINAPI worker(LPVOID unused) {
     pSubtract = resolve(game, SYM_SubtractLife, "Character::SubtractLife");
     g_fnGetAttackerIdCM = (GetUInt_t)resolve(game,
         SYM_GetAttackerIdCM, "CombatManager::GetAttackerId");
-    g_fnGetObjectId = (GetUInt_t)resolve(game,
-        SYM_GetObjectId, "Object::GetObjectId");
+    /* Object::GetObjectId is imported by Game.dll but exported by
+     * Engine.dll. DPYes resolves this symbol from Engine.dll as well. */
+    g_fnGetObjectId = (GetUInt_t)resolve(engine_module,
+        SYM_GetObjectId, "Engine.dll!Object::GetObjectId");
     g_fnGetMasterAttacker = (GetMasterAttacker_t)resolve(game,
         SYM_GetMasterAttacker, "GameEngine::GetMasterAttacker");
     g_fnLife = (GetDouble_t)resolve(game,
@@ -945,8 +954,8 @@ static DWORD WINAPI worker(LPVOID unused) {
 
     g_identity_symbols_ready = g_fnGetAttackerIdCM &&
         g_fnGetObjectId && g_fnGetMasterAttacker;
-    if (!pGMP || !pApply || !pSubtract) {
-        log_msg("FAIL: required DPS hook symbols missing");
+    if (!pGMP || !pApply || !pSubtract || !g_identity_symbols_ready) {
+        log_msg("FAIL: required DPS hook/identity symbols missing");
         return 1;
     }
 
