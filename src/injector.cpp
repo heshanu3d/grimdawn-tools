@@ -9,6 +9,7 @@
 #include <tlhelp32.h>
 
 #include <cwchar>
+#include <cwctype>
 #include <string>
 #include <vector>
 
@@ -18,7 +19,18 @@ struct Options {
     DWORD pid = 0;
     std::wstring dll_path;
     std::wstring exe_path;
+    std::wstring config_path;
     bool allow_launch = true;
+    bool dll_from_cli = false;
+    bool exe_from_cli = false;
+    bool config_from_cli = false;
+};
+
+struct LauncherConfig {
+    std::wstring game_x86;
+    std::wstring game_x64;
+    std::wstring dll_x86;
+    std::wstring dll_x64;
 };
 
 std::wstring last_error_message(DWORD error) {
@@ -60,6 +72,199 @@ bool file_exists(const std::wstring &path) {
         !(attrs & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+std::wstring path_directory(const std::wstring &path) {
+    size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? L"." : path.substr(0, slash);
+}
+
+std::wstring path_filename(const std::wstring &path) {
+    size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? path : path.substr(slash + 1);
+}
+
+std::wstring join_path(const std::wstring &directory,
+    const std::wstring &path) {
+    if (directory.empty() || directory == L".")
+        return path;
+    if (directory.back() == L'\\' || directory.back() == L'/')
+        return directory + path;
+    return directory + L"\\" + path;
+}
+
+bool path_is_rooted(const std::wstring &path) {
+    if (path.empty())
+        return false;
+    if (path[0] == L'\\' || path[0] == L'/')
+        return true;
+    return path.size() >= 2 && path[1] == L':';
+}
+
+std::wstring expand_environment(const std::wstring &value) {
+    DWORD size = ExpandEnvironmentStringsW(value.c_str(), nullptr, 0);
+    if (!size)
+        return value;
+    std::vector<wchar_t> buffer(size);
+    DWORD written = ExpandEnvironmentStringsW(value.c_str(), buffer.data(),
+        static_cast<DWORD>(buffer.size()));
+    return written && written <= buffer.size()
+        ? std::wstring(buffer.data()) : value;
+}
+
+std::wstring resolve_path(const std::wstring &path,
+    const std::wstring &base_directory) {
+    std::wstring expanded = expand_environment(path);
+    return full_path(path_is_rooted(expanded)
+        ? expanded : join_path(base_directory, expanded));
+}
+
+std::wstring trim(const std::wstring &value) {
+    size_t begin = 0;
+    while (begin < value.size() && iswspace(value[begin]))
+        ++begin;
+    size_t end = value.size();
+    while (end > begin && iswspace(value[end - 1]))
+        --end;
+    return value.substr(begin, end - begin);
+}
+
+std::wstring unquote(std::wstring value) {
+    value = trim(value);
+    if (value.size() >= 2 &&
+        ((value.front() == L'"' && value.back() == L'"') ||
+         (value.front() == L'\'' && value.back() == L'\''))) {
+        value = trim(value.substr(1, value.size() - 2));
+    }
+    return value;
+}
+
+bool decode_text(const std::vector<unsigned char> &bytes,
+    std::wstring *text) {
+    text->clear();
+    if (bytes.empty())
+        return true;
+
+    if (bytes.size() >= 2 && bytes[0] == 0xff && bytes[1] == 0xfe) {
+        for (size_t i = 2; i + 1 < bytes.size(); i += 2) {
+            wchar_t ch = static_cast<wchar_t>(bytes[i] |
+                (static_cast<unsigned>(bytes[i + 1]) << 8));
+            if (ch != 0xfeff)
+                text->push_back(ch);
+        }
+        return true;
+    }
+    if (bytes.size() >= 2 && bytes[0] == 0xfe && bytes[1] == 0xff) {
+        for (size_t i = 2; i + 1 < bytes.size(); i += 2) {
+            wchar_t ch = static_cast<wchar_t>(
+                (static_cast<unsigned>(bytes[i]) << 8) | bytes[i + 1]);
+            if (ch != 0xfeff)
+                text->push_back(ch);
+        }
+        return true;
+    }
+
+    size_t offset = bytes.size() >= 3 && bytes[0] == 0xef &&
+        bytes[1] == 0xbb && bytes[2] == 0xbf ? 3 : 0;
+    const char *data = reinterpret_cast<const char *>(bytes.data() + offset);
+    int byte_count = static_cast<int>(bytes.size() - offset);
+    if (!byte_count)
+        return true;
+
+    UINT code_page = CP_UTF8;
+    DWORD flags = MB_ERR_INVALID_CHARS;
+    int char_count = MultiByteToWideChar(code_page, flags, data, byte_count,
+        nullptr, 0);
+    if (!char_count) {
+        code_page = CP_ACP;
+        flags = 0;
+        char_count = MultiByteToWideChar(code_page, flags, data, byte_count,
+            nullptr, 0);
+    }
+    if (!char_count)
+        return false;
+    text->resize(static_cast<size_t>(char_count));
+    return MultiByteToWideChar(code_page, flags, data, byte_count,
+        &(*text)[0], char_count) == char_count;
+}
+
+bool read_text_file(const std::wstring &path, std::wstring *text,
+    std::wstring *error) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        *error = last_error_message(GetLastError());
+        return false;
+    }
+
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart > 1024 * 1024) {
+        *error = size.QuadPart > 1024 * 1024
+            ? L"configuration file is larger than 1 MiB"
+            : last_error_message(GetLastError());
+        CloseHandle(file);
+        return false;
+    }
+
+    std::vector<unsigned char> bytes(static_cast<size_t>(size.QuadPart));
+    DWORD read = 0;
+    bool ok = bytes.empty() ||
+        (ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()),
+            &read, nullptr) && read == bytes.size());
+    if (!ok)
+        *error = last_error_message(GetLastError());
+    CloseHandle(file);
+    if (!ok)
+        return false;
+    if (!decode_text(bytes, text)) {
+        *error = L"unsupported text encoding";
+        return false;
+    }
+    return true;
+}
+
+bool load_launcher_config(const std::wstring &path, LauncherConfig *config,
+    std::wstring *error) {
+    std::wstring text;
+    if (!read_text_file(path, &text, error))
+        return false;
+
+    bool in_launcher = false;
+    size_t offset = 0;
+    while (offset <= text.size()) {
+        size_t end = text.find_first_of(L"\r\n", offset);
+        std::wstring line = trim(text.substr(offset,
+            end == std::wstring::npos ? std::wstring::npos : end - offset));
+        if (!line.empty() && line.front() != L'#' && line.front() != L';') {
+            if (line.front() == L'[' && line.back() == L']') {
+                std::wstring section = trim(line.substr(1, line.size() - 2));
+                in_launcher = _wcsicmp(section.c_str(), L"launcher") == 0;
+            } else if (in_launcher) {
+                size_t equals = line.find(L'=');
+                if (equals != std::wstring::npos) {
+                    std::wstring key = trim(line.substr(0, equals));
+                    std::wstring value = unquote(line.substr(equals + 1));
+                    if (_wcsicmp(key.c_str(), L"game_x86") == 0)
+                        config->game_x86 = value;
+                    else if (_wcsicmp(key.c_str(), L"game_x64") == 0)
+                        config->game_x64 = value;
+                    else if (_wcsicmp(key.c_str(), L"dll_x86") == 0)
+                        config->dll_x86 = value;
+                    else if (_wcsicmp(key.c_str(), L"dll_x64") == 0)
+                        config->dll_x64 = value;
+                    /* Unknown fields (including injector, wait_settle and
+                     * wait_process) are intentionally ignored. */
+                }
+            }
+        }
+        if (end == std::wstring::npos)
+            break;
+        offset = end + 1;
+        if (offset < text.size() && text[end] == L'\r' &&
+            text[offset] == L'\n')
+            ++offset;
+    }
+    return true;
+}
+
 bool same_architecture(HANDLE process) {
     using IsWow64Process2Fn = BOOL (WINAPI *)(HANDLE, USHORT *, USHORT *);
     auto is_wow64_process2 = reinterpret_cast<IsWow64Process2Fn>(
@@ -89,7 +294,12 @@ bool same_architecture(HANDLE process) {
     return self_wow64 == target_wow64;
 }
 
-DWORD find_matching_process(void) {
+DWORD find_matching_process(const std::wstring &expected_exe_path) {
+    std::wstring expected_path = expected_exe_path.empty()
+        ? L"" : full_path(expected_exe_path);
+    std::wstring expected_name = expected_path.empty()
+        ? L"Grim Dawn.exe" : path_filename(expected_path);
+
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE)
         return 0;
@@ -99,17 +309,26 @@ DWORD find_matching_process(void) {
     DWORD result = 0;
     if (Process32FirstW(snapshot, &entry)) {
         do {
-            if (_wcsicmp(entry.szExeFile, L"Grim Dawn.exe") != 0)
+            if (_wcsicmp(entry.szExeFile, expected_name.c_str()) != 0)
                 continue;
             HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
                 FALSE, entry.th32ProcessID);
-            if (process) {
-                bool match = same_architecture(process);
-                CloseHandle(process);
-                if (match) {
-                    result = entry.th32ProcessID;
-                    break;
-                }
+            if (!process)
+                continue;
+
+            bool match = same_architecture(process);
+            if (match && !expected_path.empty()) {
+                std::vector<wchar_t> image_path(32768);
+                DWORD image_size = static_cast<DWORD>(image_path.size());
+                match = QueryFullProcessImageNameW(process, 0,
+                    image_path.data(), &image_size) &&
+                    _wcsicmp(full_path(std::wstring(image_path.data(),
+                        image_size)).c_str(), expected_path.c_str()) == 0;
+            }
+            CloseHandle(process);
+            if (match) {
+                result = entry.th32ProcessID;
+                break;
             }
         } while (Process32NextW(snapshot, &entry));
     }
@@ -293,21 +512,29 @@ bool launch_game(const std::wstring &exe_path, PROCESS_INFORMATION *pi) {
 void print_usage(const wchar_t *program) {
     wprintf(L"dpyes-ext Grim Dawn injector (%ls)\n\n",
         sizeof(void *) == 8 ? L"x64" : L"x86");
-    wprintf(L"Usage: %ls [--pid PID] [--dll PATH] [--exe PATH] "
-        L"[--no-launch]\n\n", program);
-    wprintf(L"Without options, attaches to a matching running Grim Dawn. If "
-        L"none is running, it launches the default executable next to the "
-        L"injector.\n");
+    wprintf(L"Usage: %ls [--config PATH] [--pid PID] [--dll PATH] "
+        L"[--exe PATH] [--no-launch]\n\n", program);
+    wprintf(L"By default, reads launcher.cfg next to the injector. The %ls "
+        L"build uses game_%ls and dll_%ls. Command-line paths override the "
+        L"configuration file.\n",
+        sizeof(void *) == 8 ? L"x64" : L"x86",
+        sizeof(void *) == 8 ? L"x64" : L"x86",
+        sizeof(void *) == 8 ? L"x64" : L"x86");
 }
 
 bool parse_options(int argc, wchar_t **argv, Options *options) {
     for (int i = 1; i < argc; ++i) {
         if (_wcsicmp(argv[i], L"--pid") == 0 && i + 1 < argc) {
             options->pid = wcstoul(argv[++i], nullptr, 10);
+        } else if (_wcsicmp(argv[i], L"--config") == 0 && i + 1 < argc) {
+            options->config_path = argv[++i];
+            options->config_from_cli = true;
         } else if (_wcsicmp(argv[i], L"--dll") == 0 && i + 1 < argc) {
             options->dll_path = argv[++i];
+            options->dll_from_cli = true;
         } else if (_wcsicmp(argv[i], L"--exe") == 0 && i + 1 < argc) {
             options->exe_path = argv[++i];
+            options->exe_from_cli = true;
         } else if (_wcsicmp(argv[i], L"--no-launch") == 0) {
             options->allow_launch = false;
         } else if (_wcsicmp(argv[i], L"--help") == 0 ||
@@ -331,44 +558,96 @@ int wmain(int argc, wchar_t **argv) {
         return 2;
     }
 
-    std::wstring directory = module_directory();
+    const std::wstring directory = module_directory();
+    if (options.config_path.empty())
+        options.config_path = join_path(directory, L"launcher.cfg");
+    else
+        options.config_path = full_path(expand_environment(options.config_path));
+
+    LauncherConfig config;
+    bool config_loaded = false;
+    if (file_exists(options.config_path)) {
+        std::wstring error;
+        if (!load_launcher_config(options.config_path, &config, &error)) {
+            fwprintf(stderr, L"Unable to read configuration %ls: %ls\n",
+                options.config_path.c_str(), error.c_str());
+            return 3;
+        }
+        config_loaded = true;
+        wprintf(L"Loaded configuration: %ls\n", options.config_path.c_str());
+    } else if (options.config_from_cli) {
+        fwprintf(stderr, L"Configuration file not found: %ls\n",
+            options.config_path.c_str());
+        return 3;
+    }
+
+    bool exe_path_is_explicit = options.exe_from_cli;
+    if (config_loaded) {
+        const std::wstring &configured_dll = sizeof(void *) == 8
+            ? config.dll_x64 : config.dll_x86;
+        const std::wstring &configured_game = sizeof(void *) == 8
+            ? config.game_x64 : config.game_x86;
+        const std::wstring config_directory =
+            path_directory(options.config_path);
+        if (!options.dll_from_cli && !configured_dll.empty())
+            options.dll_path = resolve_path(configured_dll, config_directory);
+        if (!options.exe_from_cli && !configured_game.empty()) {
+            options.exe_path = resolve_path(configured_game, config_directory);
+            exe_path_is_explicit = true;
+        }
+    }
+
     if (options.dll_path.empty()) {
-        options.dll_path = directory +
-            (sizeof(void *) == 8 ? L"\\dpyes_ext-x64.dll"
-                                 : L"\\dpyes_ext-x86.dll");
+        options.dll_path = join_path(directory,
+            sizeof(void *) == 8 ? L"dpyes_ext-x64.dll"
+                                 : L"dpyes_ext-x86.dll");
+    } else if (options.dll_from_cli) {
+        options.dll_path = full_path(expand_environment(options.dll_path));
     }
     options.dll_path = full_path(options.dll_path);
     if (!file_exists(options.dll_path)) {
         fwprintf(stderr, L"DLL not found: %ls\n", options.dll_path.c_str());
-        return 3;
+        return 4;
     }
 
-    DWORD pid = options.pid ? options.pid : find_matching_process();
+    if (options.exe_from_cli)
+        options.exe_path = full_path(expand_environment(options.exe_path));
+
+    const std::wstring expected_running_exe = exe_path_is_explicit
+        ? options.exe_path : L"";
+    DWORD pid = options.pid ? options.pid
+                            : find_matching_process(expected_running_exe);
     if (pid)
-        return inject_dll(pid, options.dll_path) ? 0 : 4;
+        return inject_dll(pid, options.dll_path) ? 0 : 5;
 
     if (!options.allow_launch) {
-        fwprintf(stderr, L"No matching Grim Dawn process is running.\n");
-        return 5;
+        if (expected_running_exe.empty()) {
+            fwprintf(stderr, L"No matching Grim Dawn process is running.\n");
+        } else {
+            fwprintf(stderr, L"Configured game process is not running: %ls\n",
+                expected_running_exe.c_str());
+        }
+        return 6;
     }
 
     if (options.exe_path.empty()) {
-        options.exe_path = directory +
-            (sizeof(void *) == 8 ? L"\\x64\\Grim Dawn.exe"
-                                 : L"\\Grim Dawn.exe");
+        options.exe_path = join_path(directory,
+            sizeof(void *) == 8 ? L"x64\\Grim Dawn.exe"
+                                 : L"Grim Dawn.exe");
     }
     options.exe_path = full_path(options.exe_path);
     if (!file_exists(options.exe_path)) {
         fwprintf(stderr,
             L"Game executable not found: %ls\n"
-            L"Copy the injector and DLL to the Grim Dawn directory, or use "
-            L"--exe PATH.\n", options.exe_path.c_str());
-        return 6;
+            L"Set game_%ls in launcher.cfg, copy the injector to the Grim "
+            L"Dawn directory, or use --exe PATH.\n", options.exe_path.c_str(),
+            sizeof(void *) == 8 ? L"x64" : L"x86");
+        return 7;
     }
 
     PROCESS_INFORMATION process = {};
     if (!launch_game(options.exe_path, &process))
-        return 7;
+        return 8;
 
     /* Let the Windows loader initialize the process before resolving the
      * remote module that owns LoadLibraryW. inject_dll() also polls the
@@ -379,5 +658,5 @@ int wmain(int argc, wchar_t **argv) {
         wprintf(L"Started Grim Dawn (PID %lu).\n", process.dwProcessId);
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
-    return injected ? 0 : 8;
+    return injected ? 0 : 9;
 }

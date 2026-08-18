@@ -1,0 +1,11 @@
+# launcher configuration - edit paths here, not in the .bat files
+[launcher]
+game_x86 = D:\Games\Grim Dawn\Grim Dawn.exe
+game_x64 = D:\Games\Grim Dawn\x64\Grim Dawn.exe
+dll_x86  = dpyes_ext-x86.dll
+dll_x64  = dpyes_ext-x64.dll
+
+# The injector accepts unknown fields and ignores these compatibility values.
+injector = ignored
+wait_settle = 6
+wait_process = 40

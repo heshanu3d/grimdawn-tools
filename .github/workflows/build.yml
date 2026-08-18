@@ -76,5 +76,6 @@ jobs:
             dist/dpyes_injector-x64.exe
             dist/dpyes_ext-x86.dll
             dist/dpyes_injector-x86.exe
+            launcher.cfg.example
           if-no-files-found: error
           compression-level: 9

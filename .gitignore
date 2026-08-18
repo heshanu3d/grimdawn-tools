@@ -2,6 +2,7 @@
 /*.dll
 /*.exe
 /dpyes_ext.log*
+/launcher.cfg
 /dist/
 /.build/
 

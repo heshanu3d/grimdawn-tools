@@ -55,33 +55,80 @@ dpyes_injector-x64.exe  -> dpyes_ext-x64.dll  -> x64 Grim Dawn
 dpyes_injector-x86.exe  -> dpyes_ext-x86.dll  -> x86 Grim Dawn
 ```
 
-### 默认方式
+### 使用 `launcher.cfg`
 
-把四个构建产物复制到 Grim Dawn 安装目录，然后运行对应架构的注入器。
+注入器默认读取**注入器所在目录**中的 `launcher.cfg`。可以复制仓库中的
+`launcher.cfg.example` 并改名为 `launcher.cfg`：
 
-如果已运行对应架构的 `Grim Dawn.exe`，注入器会附加到现有进程。如果没有运行游戏：
+```ini
+# launcher configuration - edit paths here, not in the .bat files
+[launcher]
+game_x86 = D:\Games\Grim Dawn\Grim Dawn.exe
+game_x64 = D:\Games\Grim Dawn\x64\Grim Dawn.exe
+dll_x86  = dpyes_ext-x86.dll
+dll_x64  = dpyes_ext-x64.dll
 
-- x64 注入器默认启动 `x64\Grim Dawn.exe`
-- x86 注入器默认启动根目录下的 `Grim Dawn.exe`
+injector = ignored
+wait_settle = 6
+wait_process = 40
+```
+
+两个注入器只读取与自身架构对应的字段：
+
+- `dpyes_injector-x64.exe` 使用 `game_x64` 和 `dll_x64`
+- `dpyes_injector-x86.exe` 使用 `game_x86` 和 `dll_x86`
+
+配置中的绝对路径直接使用；相对路径以 `launcher.cfg` 所在目录为基准，
+所以 DLL 通常只需填写文件名。路径支持 `%ENV_VAR%` 环境变量，并可使用成对的
+单引号或双引号。配置文件支持 UTF-8、UTF-8 BOM、UTF-16 BOM，以及系统 ANSI
+代码页，因此包含中文的 Windows 路径也可以读取。
+
+`injector`、`wait_settle`、`wait_process` 和其他未知字段会被忽略。它们可以保留，
+以兼容已有的启动配置。
+
+如果配置指定的游戏已经运行，注入器会同时核对**进程架构和可执行文件完整路径**，
+避免机器上存在多个 Grim Dawn 版本时注入到错误进程；否则启动配置指定的游戏，
+再注入对应 DLL。
+
+### 未提供配置文件时
+
+如果注入器旁边没有 `launcher.cfg`，仍保留旧的默认行为。把四个构建产物复制到
+Grim Dawn 安装目录，然后运行对应架构的注入器：
+
+- x64 注入器默认使用 `dpyes_ext-x64.dll`，并启动 `x64\Grim Dawn.exe`
+- x86 注入器默认使用 `dpyes_ext-x86.dll`，并启动根目录下的 `Grim Dawn.exe`
+
+如果已有同架构的 `Grim Dawn.exe` 正在运行，则直接附加到现有进程。
 
 ### 命令行参数
 
 ```text
+--config PATH   使用指定配置文件，而不是注入器旁边的 launcher.cfg
 --pid PID       注入指定 PID
 --dll PATH      使用指定 DLL
---exe PATH      找不到运行中的游戏时启动指定可执行文件
+--exe PATH      查找或启动指定完整路径的可执行文件
 --no-launch     只附加，不自动启动游戏
 --help          显示帮助
+```
+
+路径的优先级是：
+
+```text
+--dll / --exe 命令行参数 > launcher.cfg > 内置默认路径
 ```
 
 例如：
 
 ```bat
+dpyes_injector-x64.exe
+dpyes_injector-x64.exe --config "D:\Game Tools\launcher.cfg"
 dpyes_injector-x64.exe --exe "D:\Games\Grim Dawn\x64\Grim Dawn.exe"
 dpyes_injector-x86.exe --pid 12345
 ```
 
-如果 Grim Dawn 以管理员身份运行，注入器也需要以管理员身份运行。
+如果显式使用 `--config` 指定的文件不存在或无法解析，注入器会报错退出；默认位置
+没有 `launcher.cfg` 时则自动回退到旧行为。如果 Grim Dawn 以管理员身份运行，
+注入器也需要以管理员身份运行。
 
 ## 第三方代码
 
