@@ -1,4 +1,4 @@
-/* dpyes-ext — external-UI reimplementation of DPYes DPS meters for Grim Dawn.
+/* dpyes-ext — DPYes DPS meter reimplementation for Grim Dawn.
  *
  * DPS behavior aligned with DPYes 18p:
  *   - CombatManager::ApplyDamage captures attacker/target ownership context.
@@ -9,13 +9,15 @@
  *   - DPS divisor is the active event span, clamped to at least one second.
  *   - Running totals and a retained best-average snapshot are kept per meter.
  *
- * The presentation remains an external Win32 window rather than DPYes's ImGui
- * overlays, but the damage collection and aggregation semantics follow DPYes.
+ * The existing DPS presentation remains in its external Win32 window. A small
+ * Dear ImGui in-game overlay is also installed as the first rendering proof of
+ * concept before the DPS controls are migrated into the game.
  */
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
 #include <MinHook.h>
+#include "imgui_overlay.h"
 
 #define LOG_PREFIX "GDEXT: "
 #define LOG_FILE ("\\\\?\\D:\\Game\\grimdawn.Build.24346246\\dpyes-ext\\dpyes_ext.log")
@@ -1655,6 +1657,21 @@ static DWORD WINAPI worker(LPVOID unused) {
         line[sizeof(line) - 1] = '\0';
         log_msg(line);
     }
+    {
+        MH_STATUS mh_status = MH_Initialize();
+        if (mh_status != MH_OK && mh_status != MH_ERROR_ALREADY_INITIALIZED) {
+            log_msg("FAIL: MH_Initialize");
+            return 1;
+        }
+    }
+    /* The rendering proof-of-concept is independent from Game.dll symbols,
+     * so install it first. It can still render even if a later DPS signature
+     * changes in a future game update. */
+    if (imgui_overlay_install_hooks())
+        log_msg("ImGui overlay: DirectX render hooks installed (F10 toggles UI)");
+    else
+        log_msg("WARN: ImGui overlay DirectX hooks were not installed");
+
     for (i = 0; i < 60 && (!game || !engine_module); ++i) {
         if (!game) game = GetModuleHandleW(L"Game.dll");
         if (!engine_module) engine_module = GetModuleHandleW(L"Engine.dll");
@@ -1721,10 +1738,6 @@ static DWORD WINAPI worker(LPVOID unused) {
      * an item category is not selected. */
     autoloot_initialize(game);
 
-    if (MH_Initialize() != MH_OK) {
-        log_msg("FAIL: MH_Initialize");
-        return 1;
-    }
     if (MH_CreateHook(pGMP, (LPVOID)&HK_GetMainPlayer,
         (LPVOID *)&g_OrigGetMainPlayer) != MH_OK ||
         MH_EnableHook(pGMP) != MH_OK) {

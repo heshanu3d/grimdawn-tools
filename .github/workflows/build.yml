@@ -36,8 +36,11 @@ jobs:
           ARCH: x64
           TARGET_TRIPLE: x86_64-w64-mingw32
           CC: x86_64-w64-mingw32-clang
+          CXX: x86_64-w64-mingw32-clang++
           OUT: ${{ github.workspace }}/dist/dpyes_ext-x64.dll
+          INJECTOR_OUT: ${{ github.workspace }}/dist/dpyes_injector-x64.exe
           EXTRA_CFLAGS: -Werror -Wno-unused-parameter
+          EXTRA_CXXFLAGS: -Werror -Wno-unused-parameter
         run: ./build.sh
 
       - name: Build x86
@@ -46,8 +49,11 @@ jobs:
           ARCH: x86
           TARGET_TRIPLE: i686-w64-mingw32
           CC: i686-w64-mingw32-clang
+          CXX: i686-w64-mingw32-clang++
           OUT: ${{ github.workspace }}/dist/dpyes_ext-x86.dll
+          INJECTOR_OUT: ${{ github.workspace }}/dist/dpyes_injector-x86.exe
           EXTRA_CFLAGS: -Werror -Wno-unused-parameter
+          EXTRA_CXXFLAGS: -Werror -Wno-unused-parameter
         run: ./build.sh
 
       - name: Verify PE architectures
@@ -56,15 +62,19 @@ jobs:
           set -euo pipefail
           file dist/dpyes_ext-x64.dll | tee /dev/stderr | grep -q 'PE32+.*x86-64'
           file dist/dpyes_ext-x86.dll | tee /dev/stderr | grep -q 'PE32 executable.*Intel 80386'
+          file dist/dpyes_injector-x64.exe | tee /dev/stderr | grep -q 'PE32+.*x86-64'
+          file dist/dpyes_injector-x86.exe | tee /dev/stderr | grep -q 'PE32 executable.*Intel 80386'
 
-      # upload-artifact 会自行生成一个 ZIP，因此这里直接上传两个 DLL，
+      # upload-artifact 会自行生成一个 ZIP，因此这里直接上传 DLL 和注入器，
       # 避免下载后出现 ZIP 中再嵌套一个同名 ZIP。
-      - name: Upload combined DLL package
+      - name: Upload combined runtime package
         uses: actions/upload-artifact@v4
         with:
           name: dpyes-ext-windows-x86-x64
           path: |
             dist/dpyes_ext-x64.dll
+            dist/dpyes_injector-x64.exe
             dist/dpyes_ext-x86.dll
+            dist/dpyes_injector-x86.exe
           if-no-files-found: error
           compression-level: 9
