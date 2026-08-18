@@ -4,7 +4,24 @@ set -euo pipefail
 
 ROOT="${ROOT:-$(cd "$(dirname "$0")" && pwd)}"
 MH="$ROOT/third_party/minhook"
-ARCH="${ARCH:-x64}"
+
+# With no ARCH argument, build both Windows architectures in one invocation.
+# ARCH remains supported so CI and advanced callers can build only one target.
+if [[ -z "${ARCH:-}" ]]; then
+  echo "building x64 and x86 DLLs..."
+  ARCH=x64 \
+    TARGET_TRIPLE="${TARGET_TRIPLE_X64:-x86_64-w64-mingw32}" \
+    CC="${CC_X64:-}" \
+    OUT="${OUT_X64:-$ROOT/dpyes_ext-x64.dll}" \
+    "$0"
+  ARCH=x86 \
+    TARGET_TRIPLE="${TARGET_TRIPLE_X86:-i686-w64-mingw32}" \
+    CC="${CC_X86:-}" \
+    OUT="${OUT_X86:-$ROOT/dpyes_ext-x86.dll}" \
+    "$0"
+  echo "built both: $ROOT/dpyes_ext-x64.dll and $ROOT/dpyes_ext-x86.dll"
+  exit 0
+fi
 
 case "$ARCH" in
   x64|x86_64|amd64)
