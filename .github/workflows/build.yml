@@ -57,19 +57,14 @@ jobs:
           file dist/dpyes_ext-x64.dll | tee /dev/stderr | grep -q 'PE32+.*x86-64'
           file dist/dpyes_ext-x86.dll | tee /dev/stderr | grep -q 'PE32 executable.*Intel 80386'
 
-      - name: Package both architectures
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd dist
-          zip -9 dpyes-ext-windows-x86-x64.zip \
-            dpyes_ext-x64.dll dpyes_ext-x86.dll
-          unzip -l dpyes-ext-windows-x86-x64.zip
-
+      # upload-artifact 会自行生成一个 ZIP，因此这里直接上传两个 DLL，
+      # 避免下载后出现 ZIP 中再嵌套一个同名 ZIP。
       - name: Upload combined DLL package
         uses: actions/upload-artifact@v4
         with:
           name: dpyes-ext-windows-x86-x64
-          path: dist/dpyes-ext-windows-x86-x64.zip
+          path: |
+            dist/dpyes_ext-x64.dll
+            dist/dpyes_ext-x86.dll
           if-no-files-found: error
-          compression-level: 0
+          compression-level: 9
