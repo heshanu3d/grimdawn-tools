@@ -38,6 +38,9 @@
 #define SYM_GetAreaNameTag       "?GetAreaNameTag@Engine@GAME@@QEBAAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@XZ"
 #define SYM_LocalizationInstance "?Instance@LocalizationManager@GAME@@SAAEAV12@XZ"
 #define SYM_LocalizeNoParams     "?LocalizeWithoutParams@LocalizationManager@GAME@@QEAAPEBGPEBD@Z"
+#define SYM_EngineGlobal          "?gEngine@GAME@@3PEAVEngine@1@EA"
+#define SYM_GetGameInfo           "?GetGameInfo@Engine@GAME@@QEAAPEAVGameInfo@2@XZ"
+#define SYM_GetLevelName          "?GetLevelName@GameInfo@GAME@@QEAAAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@XZ"
 #define SYM_ItemClassInfo       "?GetStaticClassInfo@Item@GAME@@SAAEBVRTTI_ClassInfo@2@XZ"
 #define SYM_BlueprintClassInfo  "?GetStaticClassInfo@ItemArtifactFormula@GAME@@SAAEBVRTTI_ClassInfo@2@XZ"
 #define SYM_LoreClassInfo       "?GetStaticClassInfo@ItemNote@GAME@@SAAEBVRTTI_ClassInfo@2@XZ"
@@ -66,6 +69,9 @@
 #define SYM_GetAreaNameTag       "?GetAreaNameTag@Engine@GAME@@QBEABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@XZ"
 #define SYM_LocalizationInstance "?Instance@LocalizationManager@GAME@@SAAAV12@XZ"
 #define SYM_LocalizeNoParams     "?LocalizeWithoutParams@LocalizationManager@GAME@@QAEPBGPBD@Z"
+#define SYM_EngineGlobal          "?gEngine@GAME@@3PAVEngine@1@A"
+#define SYM_GetGameInfo           "?GetGameInfo@Engine@GAME@@QAEPAVGameInfo@2@XZ"
+#define SYM_GetLevelName          "?GetLevelName@GameInfo@GAME@@QAEABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@XZ"
 #define SYM_ItemClassInfo       "?GetStaticClassInfo@Item@GAME@@SAABVRTTI_ClassInfo@2@XZ"
 #define SYM_BlueprintClassInfo  "?GetStaticClassInfo@ItemArtifactFormula@GAME@@SAABVRTTI_ClassInfo@2@XZ"
 #define SYM_LoreClassInfo       "?GetStaticClassInfo@ItemNote@GAME@@SAABVRTTI_ClassInfo@2@XZ"
@@ -152,6 +158,8 @@ typedef const void *(GAME_MEMBER_CALL *GetAreaNameTag_t)(void *self);
 typedef void *(*LocalizationInstance_t)(void);
 typedef const wchar_t *(GAME_MEMBER_CALL *LocalizeWithoutParams_t)(void *self,
     const char *tag);
+typedef void *(GAME_MEMBER_CALL *GetPointer_t)(void *self);
+typedef const void *(GAME_MEMBER_CALL *GetStringReference_t)(void *self);
 
 static GetMainPlayer_t g_OrigGetMainPlayer;
 static ApplyDamageCM_t g_OrigApplyDamageCM;
@@ -167,6 +175,9 @@ static GetWorldPosition_t g_fnGetWorldPosition;
 static GetAreaNameTag_t g_fnGetAreaNameTag;
 static LocalizationInstance_t g_fnLocalizationInstance;
 static LocalizeWithoutParams_t g_fnLocalizeWithoutParams;
+static void **g_engine_global;
+static GetPointer_t g_fnGetGameInfo;
+static GetStringReference_t g_fnGetLevelName;
 
 static void * volatile g_engine;
 static void * volatile g_player;
@@ -1147,7 +1158,6 @@ static int read_player_world_position(float *x, float *y, float *z) {
     return 1;
 }
 
-
 static int copy_msvc_string(const void *string_object, char *out,
     SIZE_T out_count) {
     /* Engine.dll was built with Microsoft's std::string ABI.  Its stable
@@ -1178,27 +1188,72 @@ static int copy_msvc_string(const void *string_object, char *out,
     return 1;
 }
 
+static int game_string_to_wide(const void *string_object, wchar_t *out,
+    int out_count) {
+    char text[512];
+    int written;
+
+    if (!copy_msvc_string(string_object, text, sizeof(text)))
+        return 0;
+    written = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1,
+        out, out_count);
+    if (!written)
+        written = MultiByteToWideChar(CP_ACP, 0, text, -1, out, out_count);
+    if (!written) {
+        out[0] = L'\0';
+        return 0;
+    }
+    out[out_count - 1] = L'\0';
+    return out[0] != L'\0';
+}
+
 static int read_current_area_name(wchar_t *out, int out_count) {
     char tag[256];
-    const void *tag_string;
+    const void *tag_string = NULL;
+    void *engine;
     void *localization;
     const wchar_t *localized;
 
-    if (!out || out_count < 2 || !g_engine || !g_fnGetAreaNameTag ||
-        !g_fnLocalizationInstance || !g_fnLocalizeWithoutParams)
+    if (!out || out_count < 2)
         return 0;
     out[0] = L'\0';
-    tag_string = g_fnGetAreaNameTag((void *)g_engine);
-    if (!copy_msvc_string(tag_string, tag, sizeof(tag)))
+
+    /* GetMainPlayer captures GameEngine*. Avoid assuming that its Engine base
+     * is at offset zero: use Engine.dll's exported GAME::gEngine pointer for
+     * Engine member calls, with the captured pointer only as a fallback. */
+    engine = g_engine_global ? *g_engine_global : NULL;
+    if (!engine)
+        engine = (void *)g_engine;
+    if (!engine)
         return 0;
-    localization = g_fnLocalizationInstance();
-    if (!localization)
-        return 0;
-    localized = g_fnLocalizeWithoutParams(localization, tag);
-    if (!localized || !localized[0])
-        return 0;
-    lstrcpynW(out, localized, out_count);
-    return out[0] != L'\0';
+
+    if (g_fnGetAreaNameTag) {
+        tag_string = g_fnGetAreaNameTag(engine);
+        if (copy_msvc_string(tag_string, tag, sizeof(tag)) &&
+            g_fnLocalizationInstance && g_fnLocalizeWithoutParams) {
+            localization = g_fnLocalizationInstance();
+            localized = localization
+                ? g_fnLocalizeWithoutParams(localization, tag) : NULL;
+            if (localized && localized[0]) {
+                lstrcpynW(out, localized, out_count);
+                if (out[0])
+                    return 1;
+            }
+        }
+    }
+
+    /* Some maps do not expose an area tag at all times. Fall back to the
+     * current level name so the UI never drops the map field completely. */
+    if (g_fnGetGameInfo && g_fnGetLevelName) {
+        void *game_info = g_fnGetGameInfo(engine);
+        const void *level_name = game_info ? g_fnGetLevelName(game_info) : NULL;
+        if (game_string_to_wide(level_name, out, out_count))
+            return 1;
+    }
+
+    /* If localization failed but an area tag exists, showing the tag is still
+     * more useful for debugging than omitting the map name altogether. */
+    return game_string_to_wide(tag_string, out, out_count);
 }
 
 static void refresh_stats(HWND h) {
@@ -1640,6 +1695,12 @@ static DWORD WINAPI worker(LPVOID unused) {
     g_fnLocalizeWithoutParams = (LocalizeWithoutParams_t)resolve(engine_module,
         SYM_LocalizeNoParams,
         "Engine.dll!LocalizationManager::LocalizeWithoutParams");
+    g_engine_global = (void **)resolve(engine_module,
+        SYM_EngineGlobal, "Engine.dll!GAME::gEngine");
+    g_fnGetGameInfo = (GetPointer_t)resolve(engine_module,
+        SYM_GetGameInfo, "Engine.dll!Engine::GetGameInfo");
+    g_fnGetLevelName = (GetStringReference_t)resolve(engine_module,
+        SYM_GetLevelName, "Engine.dll!GameInfo::GetLevelName");
     g_fnGetMasterAttacker = (GetMasterAttacker_t)resolve(game,
         SYM_GetMasterAttacker, "GameEngine::GetMasterAttacker");
     g_fnLife = (GetDouble_t)resolve(game,
