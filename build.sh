@@ -5,14 +5,15 @@ set -euo pipefail
 ROOT="${ROOT:-$(cd "$(dirname "$0")" && pwd)}"
 MH="$ROOT/third_party/minhook"
 ARCH="${ARCH:-x64}"
-OUT="${OUT:-$ROOT/dpyes_ext.dll}"
 
 case "$ARCH" in
   x64|x86_64|amd64)
+    OUTPUT_ARCH="x64"
     TARGET_TRIPLE="${TARGET_TRIPLE:-x86_64-w64-mingw32}"
     HDE_SOURCE="$MH/src/hde/hde64.c"
     ;;
   x86|x32|i686)
+    OUTPUT_ARCH="x86"
     TARGET_TRIPLE="${TARGET_TRIPLE:-i686-w64-mingw32}"
     HDE_SOURCE="$MH/src/hde/hde32.c"
     ;;
@@ -21,6 +22,10 @@ case "$ARCH" in
     exit 1
     ;;
 esac
+
+# Keep local output names consistent with the GitHub Actions artifacts.
+# An explicit OUT value still takes precedence for callers that need another path.
+OUT="${OUT:-$ROOT/dpyes_ext-${OUTPUT_ARCH}.dll}"
 
 if [[ -n "${CC:-}" ]]; then
   COMPILER="$CC"
