@@ -35,6 +35,9 @@
 #define SYM_GetMasterAttacker   "?GetMasterAttacker@GameEngine@GAME@@QEBAII@Z"
 #define SYM_GetCoords           "?GetCoords@Entity@GAME@@QEBA?AVWorldCoords@2@XZ"
 #define SYM_GetWorldPosition    "?GetWorldPosition@WorldVec3@GAME@@QEBA?AVVec3@2@XZ"
+#define SYM_GetAreaNameTag       "?GetAreaNameTag@Engine@GAME@@QEBAAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@XZ"
+#define SYM_LocalizationInstance "?Instance@LocalizationManager@GAME@@SAAEAV12@XZ"
+#define SYM_LocalizeNoParams     "?LocalizeWithoutParams@LocalizationManager@GAME@@QEAAPEBGPEBD@Z"
 #define SYM_ItemClassInfo       "?GetStaticClassInfo@Item@GAME@@SAAEBVRTTI_ClassInfo@2@XZ"
 #define SYM_BlueprintClassInfo  "?GetStaticClassInfo@ItemArtifactFormula@GAME@@SAAEBVRTTI_ClassInfo@2@XZ"
 #define SYM_LoreClassInfo       "?GetStaticClassInfo@ItemNote@GAME@@SAAEBVRTTI_ClassInfo@2@XZ"
@@ -60,6 +63,9 @@
 #define SYM_GetMasterAttacker   "?GetMasterAttacker@GameEngine@GAME@@QBEII@Z"
 #define SYM_GetCoords           "?GetCoords@Entity@GAME@@QBE?AVWorldCoords@2@XZ"
 #define SYM_GetWorldPosition    "?GetWorldPosition@WorldVec3@GAME@@QBE?AVVec3@2@XZ"
+#define SYM_GetAreaNameTag       "?GetAreaNameTag@Engine@GAME@@QBEABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@XZ"
+#define SYM_LocalizationInstance "?Instance@LocalizationManager@GAME@@SAAAV12@XZ"
+#define SYM_LocalizeNoParams     "?LocalizeWithoutParams@LocalizationManager@GAME@@QAEPBGPBD@Z"
 #define SYM_ItemClassInfo       "?GetStaticClassInfo@Item@GAME@@SAABVRTTI_ClassInfo@2@XZ"
 #define SYM_BlueprintClassInfo  "?GetStaticClassInfo@ItemArtifactFormula@GAME@@SAABVRTTI_ClassInfo@2@XZ"
 #define SYM_LoreClassInfo       "?GetStaticClassInfo@ItemNote@GAME@@SAABVRTTI_ClassInfo@2@XZ"
@@ -142,6 +148,10 @@ typedef float (GAME_MEMBER_CALL *ExecuteDurationDamage_t)(void *self,
     float *accumulated_damage);
 typedef void *(GAME_MEMBER_CALL *GetCoords_t)(void *self, void *result);
 typedef void *(GAME_MEMBER_CALL *GetWorldPosition_t)(void *self, void *result);
+typedef const void *(GAME_MEMBER_CALL *GetAreaNameTag_t)(void *self);
+typedef void *(*LocalizationInstance_t)(void);
+typedef const wchar_t *(GAME_MEMBER_CALL *LocalizeWithoutParams_t)(void *self,
+    const char *tag);
 
 static GetMainPlayer_t g_OrigGetMainPlayer;
 static ApplyDamageCM_t g_OrigApplyDamageCM;
@@ -154,6 +164,9 @@ static GetDouble_t g_fnLife;
 static GetUInt_t g_fnXP;
 static GetCoords_t g_fnGetCoords;
 static GetWorldPosition_t g_fnGetWorldPosition;
+static GetAreaNameTag_t g_fnGetAreaNameTag;
+static LocalizationInstance_t g_fnLocalizationInstance;
+static LocalizeWithoutParams_t g_fnLocalizeWithoutParams;
 
 static void * volatile g_engine;
 static void * volatile g_player;
@@ -1134,6 +1147,60 @@ static int read_player_world_position(float *x, float *y, float *z) {
     return 1;
 }
 
+
+static int copy_msvc_string(const void *string_object, char *out,
+    SIZE_T out_count) {
+    /* Engine.dll was built with Microsoft's std::string ABI.  Its stable
+     * VS2015+ layout is a 16-byte SSO union followed by size and capacity;
+     * dpyes-ext cannot call that C++ type directly because it is built with
+     * llvm-mingw, so copy the returned const reference without taking
+     * ownership of it. */
+    const unsigned char *raw = (const unsigned char *)string_object;
+    const char *data;
+    SIZE_T size;
+    SIZE_T capacity;
+
+    if (!raw || !out || out_count < 2)
+        return 0;
+    memcpy(&size, raw + 16, sizeof(size));
+    memcpy(&capacity, raw + 16 + sizeof(size), sizeof(capacity));
+    if (!size || size >= out_count || capacity < size || capacity > 0x100000)
+        return 0;
+    if (capacity < 16) {
+        data = (const char *)raw;
+    } else {
+        memcpy(&data, raw, sizeof(data));
+        if (!data)
+            return 0;
+    }
+    memcpy(out, data, size);
+    out[size] = '\0';
+    return 1;
+}
+
+static int read_current_area_name(wchar_t *out, int out_count) {
+    char tag[256];
+    const void *tag_string;
+    void *localization;
+    const wchar_t *localized;
+
+    if (!out || out_count < 2 || !g_engine || !g_fnGetAreaNameTag ||
+        !g_fnLocalizationInstance || !g_fnLocalizeWithoutParams)
+        return 0;
+    out[0] = L'\0';
+    tag_string = g_fnGetAreaNameTag((void *)g_engine);
+    if (!copy_msvc_string(tag_string, tag, sizeof(tag)))
+        return 0;
+    localization = g_fnLocalizationInstance();
+    if (!localization)
+        return 0;
+    localized = g_fnLocalizeWithoutParams(localization, tag);
+    if (!localized || !localized[0])
+        return 0;
+    lstrcpynW(out, localized, out_count);
+    return out[0] != L'\0';
+}
+
 static void refresh_stats(HWND h) {
     HWND list = GetDlgItem(h, IDC_STATS);
 #if ENABLE_DAMAGE_LOG_UI
@@ -1159,6 +1226,9 @@ static void refresh_stats(HWND h) {
         double life = g_fnLife((void *)g_player);
         unsigned xp = g_fnXP ? g_fnXP((void *)g_player) : 0;
         float x, y, z;
+        wchar_t area_name[128];
+        int have_area_name = read_current_area_name(area_name,
+            (int)(sizeof(area_name) / sizeof(area_name[0])));
         _snwprintf(line, 256, L"血量 %.1f   经验 %u   当前口径：%s",
             life, xp,
             InterlockedCompareExchange(&g_use_mitigated, 0, 0)
@@ -1166,12 +1236,23 @@ static void refresh_stats(HWND h) {
         line[255] = L'\0';
         add_list_line(list, line);
         if (read_player_world_position(&x, &y, &z)) {
-            _snwprintf(line, 256, L"世界坐标   X %.1f   Y %.1f   Z %.1f",
-                x, y, z);
+            if (have_area_name) {
+                _snwprintf(line, 256,
+                    L"地图 %ls   世界坐标 X %.1f   Y %.1f   Z %.1f",
+                    area_name, x, y, z);
+            } else {
+                _snwprintf(line, 256, L"世界坐标 X %.1f   Y %.1f   Z %.1f",
+                    x, y, z);
+            }
+            line[255] = L'\0';
+            add_list_line(list, line);
+        } else if (have_area_name) {
+            _snwprintf(line, 256, L"地图 %ls   世界坐标：暂不可用",
+                area_name);
             line[255] = L'\0';
             add_list_line(list, line);
         } else {
-            add_list_line(list, L"世界坐标：暂不可用");
+            add_list_line(list, L"地图和世界坐标：暂不可用");
         }
         if (!g_identity_symbols_ready)
             add_list_line(list, L"警告：身份分类符号未完整解析，Other 分类可能增多");
@@ -1552,6 +1633,13 @@ static DWORD WINAPI worker(LPVOID unused) {
         SYM_GetCoords, "Engine.dll!Entity::GetCoords");
     g_fnGetWorldPosition = (GetWorldPosition_t)resolve(engine_module,
         SYM_GetWorldPosition, "Engine.dll!WorldVec3::GetWorldPosition");
+    g_fnGetAreaNameTag = (GetAreaNameTag_t)resolve(engine_module,
+        SYM_GetAreaNameTag, "Engine.dll!Engine::GetAreaNameTag");
+    g_fnLocalizationInstance = (LocalizationInstance_t)resolve(engine_module,
+        SYM_LocalizationInstance, "Engine.dll!LocalizationManager::Instance");
+    g_fnLocalizeWithoutParams = (LocalizeWithoutParams_t)resolve(engine_module,
+        SYM_LocalizeNoParams,
+        "Engine.dll!LocalizationManager::LocalizeWithoutParams");
     g_fnGetMasterAttacker = (GetMasterAttacker_t)resolve(game,
         SYM_GetMasterAttacker, "GameEngine::GetMasterAttacker");
     g_fnLife = (GetDouble_t)resolve(game,
