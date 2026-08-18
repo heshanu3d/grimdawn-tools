@@ -34,7 +34,7 @@
 #define SYM_GetObjectId         "?GetObjectId@Object@GAME@@QEBAIXZ"
 #define SYM_GetMasterAttacker   "?GetMasterAttacker@GameEngine@GAME@@QEBAII@Z"
 #define SYM_GetCoords           "?GetCoords@Entity@GAME@@QEBA?AVWorldCoords@2@XZ"
-#define SYM_GetRegionPosition   "?GetRegionPosition@WorldVec3@GAME@@QEBAAEBVVec3@2@XZ"
+#define SYM_GetWorldPosition    "?GetWorldPosition@WorldVec3@GAME@@QEBA?AVVec3@2@XZ"
 #define SYM_ItemClassInfo       "?GetStaticClassInfo@Item@GAME@@SAAEBVRTTI_ClassInfo@2@XZ"
 #define SYM_BlueprintClassInfo  "?GetStaticClassInfo@ItemArtifactFormula@GAME@@SAAEBVRTTI_ClassInfo@2@XZ"
 #define SYM_LoreClassInfo       "?GetStaticClassInfo@ItemNote@GAME@@SAAEBVRTTI_ClassInfo@2@XZ"
@@ -59,7 +59,7 @@
 #define SYM_GetObjectId         "?GetObjectId@Object@GAME@@QBEIXZ"
 #define SYM_GetMasterAttacker   "?GetMasterAttacker@GameEngine@GAME@@QBEII@Z"
 #define SYM_GetCoords           "?GetCoords@Entity@GAME@@QBE?AVWorldCoords@2@XZ"
-#define SYM_GetRegionPosition   "?GetRegionPosition@WorldVec3@GAME@@QBEABVVec3@2@XZ"
+#define SYM_GetWorldPosition    "?GetWorldPosition@WorldVec3@GAME@@QBE?AVVec3@2@XZ"
 #define SYM_ItemClassInfo       "?GetStaticClassInfo@Item@GAME@@SAABVRTTI_ClassInfo@2@XZ"
 #define SYM_BlueprintClassInfo  "?GetStaticClassInfo@ItemArtifactFormula@GAME@@SAABVRTTI_ClassInfo@2@XZ"
 #define SYM_LoreClassInfo       "?GetStaticClassInfo@ItemNote@GAME@@SAABVRTTI_ClassInfo@2@XZ"
@@ -141,7 +141,7 @@ typedef void (GAME_MEMBER_CALL *SubtractLife_t)(void *self, float damage,
 typedef float (GAME_MEMBER_CALL *ExecuteDurationDamage_t)(void *self,
     float *accumulated_damage);
 typedef void *(GAME_MEMBER_CALL *GetCoords_t)(void *self, void *result);
-typedef const float *(GAME_MEMBER_CALL *GetRegionPosition_t)(void *self);
+typedef void *(GAME_MEMBER_CALL *GetWorldPosition_t)(void *self, void *result);
 
 static GetMainPlayer_t g_OrigGetMainPlayer;
 static ApplyDamageCM_t g_OrigApplyDamageCM;
@@ -153,7 +153,7 @@ static GetMasterAttacker_t g_fnGetMasterAttacker;
 static GetDouble_t g_fnLife;
 static GetUInt_t g_fnXP;
 static GetCoords_t g_fnGetCoords;
-static GetRegionPosition_t g_fnGetRegionPosition;
+static GetWorldPosition_t g_fnGetWorldPosition;
 
 static void * volatile g_engine;
 static void * volatile g_player;
@@ -1112,24 +1112,25 @@ static void add_meter_lines(HWND list, MeterKind kind, const MeterView *view) {
     add_list_line(list, L"");
 }
 
-static int read_player_position(float *x, float *y, float *z) {
-    /* WorldCoords is an Engine.dll C++ value type. Keep its private layout
-     * opaque, provide ample aligned return storage, then use the exported
-     * WorldVec3 accessor exactly as DPYes does. */
+static int read_player_world_position(float *x, float *y, float *z) {
+    /* Entity::GetCoords returns WorldCoords, whose first component is a
+     * WorldVec3.  GetRegionPosition only returns coordinates relative to the
+     * current region/map and therefore cannot be reused as teleport input.
+     * GetWorldPosition folds the region's world offset into that value and
+     * returns the absolute Vec3 used by world-position/teleport APIs. */
     unsigned char world_coords[64] __attribute__((aligned(16)));
-    const float *region_position;
+    float world_position[4] __attribute__((aligned(16)));
     void *player = (void *)g_player;
 
-    if (!player || !g_fnGetCoords || !g_fnGetRegionPosition)
+    if (!player || !g_fnGetCoords || !g_fnGetWorldPosition)
         return 0;
     memset(world_coords, 0, sizeof(world_coords));
+    memset(world_position, 0, sizeof(world_position));
     g_fnGetCoords(player, world_coords);
-    region_position = g_fnGetRegionPosition(world_coords);
-    if (!region_position)
-        return 0;
-    *x = region_position[0];
-    *y = region_position[1];
-    *z = region_position[2];
+    g_fnGetWorldPosition(world_coords, world_position);
+    *x = world_position[0];
+    *y = world_position[1];
+    *z = world_position[2];
     return 1;
 }
 
@@ -1164,13 +1165,13 @@ static void refresh_stats(HWND h) {
                 ? L"减伤后实际伤害" : L"减伤前 RAW");
         line[255] = L'\0';
         add_list_line(list, line);
-        if (read_player_position(&x, &y, &z)) {
-            _snwprintf(line, 256, L"角色坐标   X %.1f   Y %.1f   Z %.1f",
+        if (read_player_world_position(&x, &y, &z)) {
+            _snwprintf(line, 256, L"世界坐标   X %.1f   Y %.1f   Z %.1f",
                 x, y, z);
             line[255] = L'\0';
             add_list_line(list, line);
         } else {
-            add_list_line(list, L"角色坐标：暂不可用");
+            add_list_line(list, L"世界坐标：暂不可用");
         }
         if (!g_identity_symbols_ready)
             add_list_line(list, L"警告：身份分类符号未完整解析，Other 分类可能增多");
@@ -1549,8 +1550,8 @@ static DWORD WINAPI worker(LPVOID unused) {
         SYM_GetObjectId, "Engine.dll!Object::GetObjectId");
     g_fnGetCoords = (GetCoords_t)resolve(engine_module,
         SYM_GetCoords, "Engine.dll!Entity::GetCoords");
-    g_fnGetRegionPosition = (GetRegionPosition_t)resolve(engine_module,
-        SYM_GetRegionPosition, "Engine.dll!WorldVec3::GetRegionPosition");
+    g_fnGetWorldPosition = (GetWorldPosition_t)resolve(engine_module,
+        SYM_GetWorldPosition, "Engine.dll!WorldVec3::GetWorldPosition");
     g_fnGetMasterAttacker = (GetMasterAttacker_t)resolve(game,
         SYM_GetMasterAttacker, "GameEngine::GetMasterAttacker");
     g_fnLife = (GetDouble_t)resolve(game,
