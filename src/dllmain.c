@@ -33,6 +33,8 @@
 #define SYM_GetAttackerIdCM     "?GetAttackerId@CombatManager@GAME@@QEBA?BIXZ"
 #define SYM_GetObjectId         "?GetObjectId@Object@GAME@@QEBAIXZ"
 #define SYM_GetMasterAttacker   "?GetMasterAttacker@GameEngine@GAME@@QEBAII@Z"
+#define SYM_GetCoords           "?GetCoords@Entity@GAME@@QEBA?AVWorldCoords@2@XZ"
+#define SYM_GetRegionPosition   "?GetRegionPosition@WorldVec3@GAME@@QEBAAEBVVec3@2@XZ"
 #define SYM_ItemClassInfo       "?GetStaticClassInfo@Item@GAME@@SAAEBVRTTI_ClassInfo@2@XZ"
 #define SYM_BlueprintClassInfo  "?GetStaticClassInfo@ItemArtifactFormula@GAME@@SAAEBVRTTI_ClassInfo@2@XZ"
 #define SYM_LoreClassInfo       "?GetStaticClassInfo@ItemNote@GAME@@SAAEBVRTTI_ClassInfo@2@XZ"
@@ -56,6 +58,8 @@
 #define SYM_GetAttackerIdCM     "?GetAttackerId@CombatManager@GAME@@QBE?BIXZ"
 #define SYM_GetObjectId         "?GetObjectId@Object@GAME@@QBEIXZ"
 #define SYM_GetMasterAttacker   "?GetMasterAttacker@GameEngine@GAME@@QBEII@Z"
+#define SYM_GetCoords           "?GetCoords@Entity@GAME@@QBE?AVWorldCoords@2@XZ"
+#define SYM_GetRegionPosition   "?GetRegionPosition@WorldVec3@GAME@@QBEABVVec3@2@XZ"
 #define SYM_ItemClassInfo       "?GetStaticClassInfo@Item@GAME@@SAABVRTTI_ClassInfo@2@XZ"
 #define SYM_BlueprintClassInfo  "?GetStaticClassInfo@ItemArtifactFormula@GAME@@SAABVRTTI_ClassInfo@2@XZ"
 #define SYM_LoreClassInfo       "?GetStaticClassInfo@ItemNote@GAME@@SAABVRTTI_ClassInfo@2@XZ"
@@ -136,6 +140,8 @@ typedef void (GAME_MEMBER_CALL *SubtractLife_t)(void *self, float damage,
     const void *dmgType, unsigned char a, unsigned char b);
 typedef float (GAME_MEMBER_CALL *ExecuteDurationDamage_t)(void *self,
     float *accumulated_damage);
+typedef void *(GAME_MEMBER_CALL *GetCoords_t)(void *self, void *result);
+typedef const float *(GAME_MEMBER_CALL *GetRegionPosition_t)(void *self);
 
 static GetMainPlayer_t g_OrigGetMainPlayer;
 static ApplyDamageCM_t g_OrigApplyDamageCM;
@@ -146,6 +152,8 @@ static GetUInt_t g_fnGetObjectId;
 static GetMasterAttacker_t g_fnGetMasterAttacker;
 static GetDouble_t g_fnLife;
 static GetUInt_t g_fnXP;
+static GetCoords_t g_fnGetCoords;
+static GetRegionPosition_t g_fnGetRegionPosition;
 
 static void * volatile g_engine;
 static void * volatile g_player;
@@ -1104,6 +1112,27 @@ static void add_meter_lines(HWND list, MeterKind kind, const MeterView *view) {
     add_list_line(list, L"");
 }
 
+static int read_player_position(float *x, float *y, float *z) {
+    /* WorldCoords is an Engine.dll C++ value type. Keep its private layout
+     * opaque, provide ample aligned return storage, then use the exported
+     * WorldVec3 accessor exactly as DPYes does. */
+    unsigned char world_coords[64] __attribute__((aligned(16)));
+    const float *region_position;
+    void *player = (void *)g_player;
+
+    if (!player || !g_fnGetCoords || !g_fnGetRegionPosition)
+        return 0;
+    memset(world_coords, 0, sizeof(world_coords));
+    g_fnGetCoords(player, world_coords);
+    region_position = g_fnGetRegionPosition(world_coords);
+    if (!region_position)
+        return 0;
+    *x = region_position[0];
+    *y = region_position[1];
+    *z = region_position[2];
+    return 1;
+}
+
 static void refresh_stats(HWND h) {
     HWND list = GetDlgItem(h, IDC_STATS);
 #if ENABLE_DAMAGE_LOG_UI
@@ -1128,12 +1157,21 @@ static void refresh_stats(HWND h) {
     } else {
         double life = g_fnLife((void *)g_player);
         unsigned xp = g_fnXP ? g_fnXP((void *)g_player) : 0;
+        float x, y, z;
         _snwprintf(line, 256, L"血量 %.1f   经验 %u   当前口径：%s",
             life, xp,
             InterlockedCompareExchange(&g_use_mitigated, 0, 0)
                 ? L"减伤后实际伤害" : L"减伤前 RAW");
         line[255] = L'\0';
         add_list_line(list, line);
+        if (read_player_position(&x, &y, &z)) {
+            _snwprintf(line, 256, L"角色坐标   X %.1f   Y %.1f   Z %.1f",
+                x, y, z);
+            line[255] = L'\0';
+            add_list_line(list, line);
+        } else {
+            add_list_line(list, L"角色坐标：暂不可用");
+        }
         if (!g_identity_symbols_ready)
             add_list_line(list, L"警告：身份分类符号未完整解析，Other 分类可能增多");
         add_list_line(list, L"");
@@ -1509,6 +1547,10 @@ static DWORD WINAPI worker(LPVOID unused) {
      * Engine.dll. DPYes resolves this symbol from Engine.dll as well. */
     g_fnGetObjectId = (GetUInt_t)resolve(engine_module,
         SYM_GetObjectId, "Engine.dll!Object::GetObjectId");
+    g_fnGetCoords = (GetCoords_t)resolve(engine_module,
+        SYM_GetCoords, "Engine.dll!Entity::GetCoords");
+    g_fnGetRegionPosition = (GetRegionPosition_t)resolve(engine_module,
+        SYM_GetRegionPosition, "Engine.dll!WorldVec3::GetRegionPosition");
     g_fnGetMasterAttacker = (GetMasterAttacker_t)resolve(game,
         SYM_GetMasterAttacker, "GameEngine::GetMasterAttacker");
     g_fnLife = (GetDouble_t)resolve(game,
