@@ -103,7 +103,6 @@ Grim Dawn 安装目录，然后运行对应架构的注入器：
 ### 命令行参数
 
 ```text
---config PATH   使用指定配置文件，而不是注入器旁边的 launcher.cfg
 --pid PID       注入指定 PID
 --dll PATH      使用指定 DLL
 --exe PATH      查找或启动指定完整路径的可执行文件
@@ -121,14 +120,13 @@ Grim Dawn 安装目录，然后运行对应架构的注入器：
 
 ```bat
 dpyes_injector-x64.exe
-dpyes_injector-x64.exe --config "D:\Game Tools\launcher.cfg"
 dpyes_injector-x64.exe --exe "D:\Games\Grim Dawn\x64\Grim Dawn.exe"
 dpyes_injector-x86.exe --pid 12345
 ```
 
-如果显式使用 `--config` 指定的文件不存在或无法解析，注入器会报错退出；默认位置
-没有 `launcher.cfg` 时则自动回退到旧行为。如果 Grim Dawn 以管理员身份运行，
-注入器也需要以管理员身份运行。
+注入器只会读取与其同目录的 `launcher.cfg`，不接受通过命令行指定其他配置文件。
+同目录没有 `launcher.cfg` 时会自动回退到旧行为；配置文件存在但无法解析时会报错退出。
+如果 Grim Dawn 以管理员身份运行，注入器也需要以管理员身份运行。
 
 ## 第三方代码
 

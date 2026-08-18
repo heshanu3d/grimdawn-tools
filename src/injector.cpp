@@ -19,11 +19,9 @@ struct Options {
     DWORD pid = 0;
     std::wstring dll_path;
     std::wstring exe_path;
-    std::wstring config_path;
     bool allow_launch = true;
     bool dll_from_cli = false;
     bool exe_from_cli = false;
-    bool config_from_cli = false;
 };
 
 struct LauncherConfig {
@@ -512,8 +510,8 @@ bool launch_game(const std::wstring &exe_path, PROCESS_INFORMATION *pi) {
 void print_usage(const wchar_t *program) {
     wprintf(L"dpyes-ext Grim Dawn injector (%ls)\n\n",
         sizeof(void *) == 8 ? L"x64" : L"x86");
-    wprintf(L"Usage: %ls [--config PATH] [--pid PID] [--dll PATH] "
-        L"[--exe PATH] [--no-launch]\n\n", program);
+    wprintf(L"Usage: %ls [--pid PID] [--dll PATH] [--exe PATH] "
+        L"[--no-launch]\n\n", program);
     wprintf(L"By default, reads launcher.cfg next to the injector. The %ls "
         L"build uses game_%ls and dll_%ls. Command-line paths override the "
         L"configuration file.\n",
@@ -526,9 +524,6 @@ bool parse_options(int argc, wchar_t **argv, Options *options) {
     for (int i = 1; i < argc; ++i) {
         if (_wcsicmp(argv[i], L"--pid") == 0 && i + 1 < argc) {
             options->pid = wcstoul(argv[++i], nullptr, 10);
-        } else if (_wcsicmp(argv[i], L"--config") == 0 && i + 1 < argc) {
-            options->config_path = argv[++i];
-            options->config_from_cli = true;
         } else if (_wcsicmp(argv[i], L"--dll") == 0 && i + 1 < argc) {
             options->dll_path = argv[++i];
             options->dll_from_cli = true;
@@ -559,26 +554,20 @@ int wmain(int argc, wchar_t **argv) {
     }
 
     const std::wstring directory = module_directory();
-    if (options.config_path.empty())
-        options.config_path = join_path(directory, L"launcher.cfg");
-    else
-        options.config_path = full_path(expand_environment(options.config_path));
+    const std::wstring config_path = full_path(
+        join_path(directory, L"launcher.cfg"));
 
     LauncherConfig config;
     bool config_loaded = false;
-    if (file_exists(options.config_path)) {
+    if (file_exists(config_path)) {
         std::wstring error;
-        if (!load_launcher_config(options.config_path, &config, &error)) {
+        if (!load_launcher_config(config_path, &config, &error)) {
             fwprintf(stderr, L"Unable to read configuration %ls: %ls\n",
-                options.config_path.c_str(), error.c_str());
+                config_path.c_str(), error.c_str());
             return 3;
         }
         config_loaded = true;
-        wprintf(L"Loaded configuration: %ls\n", options.config_path.c_str());
-    } else if (options.config_from_cli) {
-        fwprintf(stderr, L"Configuration file not found: %ls\n",
-            options.config_path.c_str());
-        return 3;
+        wprintf(L"Loaded configuration: %ls\n", config_path.c_str());
     }
 
     bool exe_path_is_explicit = options.exe_from_cli;
@@ -587,8 +576,7 @@ int wmain(int argc, wchar_t **argv) {
             ? config.dll_x64 : config.dll_x86;
         const std::wstring &configured_game = sizeof(void *) == 8
             ? config.game_x64 : config.game_x86;
-        const std::wstring config_directory =
-            path_directory(options.config_path);
+        const std::wstring config_directory = path_directory(config_path);
         if (!options.dll_from_cli && !configured_dll.empty())
             options.dll_path = resolve_path(configured_dll, config_directory);
         if (!options.exe_from_cli && !configured_game.empty()) {
